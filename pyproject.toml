@@ -20,3 +20,6 @@ pm_arb = "pm_arb.cli:main"
 [build-system]
 requires = ["setuptools>=68.0.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["pm_arb"]
