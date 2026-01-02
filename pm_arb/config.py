@@ -28,6 +28,7 @@ def _parse_number(value: str, target_type: type) -> Any:
 @dataclass
 class Config:
     gamma_base_url: str = "https://gamma-api.polymarket.com"
+    gamma_limit: int = 100
     clob_rest_base_url: str = "https://clob.polymarket.com"
     clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
     geoblock_url: str = "https://polymarket.com/api/geoblock"

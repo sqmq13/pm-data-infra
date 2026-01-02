@@ -13,7 +13,7 @@ from .clob_rest import RestClient, fetch_book_with_retries
 from .clob_ws import wait_for_decodable_book
 from .config import Config
 from .engine import Engine
-from .gamma import fetch_markets
+from .gamma import fetch_markets, parse_clob_token_ids
 from .reconcile import Reconciler
 from .report import generate_report
 from .sweep import sweep_cost
@@ -128,14 +128,29 @@ def contract_test_offline(config: Config, fixtures_dir: Path) -> int:
 
 
 def contract_test_online(config: Config) -> int:
-    markets = fetch_markets(config.gamma_base_url, config.rest_timeout)
+    markets = fetch_markets(
+        config.gamma_base_url,
+        config.rest_timeout,
+        limit=config.gamma_limit,
+        max_markets=config.max_markets,
+    )
     regex = config.market_regex
     engine = Engine(config)
-    candidates = engine._discover_candidates(markets)
+    filtered = engine._filter_markets(markets)
+    if filtered:
+        candidates = filtered
+    else:
+        candidates = [
+            market
+            for market in engine._discover_candidates(markets)
+            if market.get("enableOrderBook") is not False
+        ]
     attempted_payloads: list[dict[str, Any]] = []
-    for market in candidates[:10]:
-        token_ids = market.get("clobTokenIds") or market.get("clob_token_ids")
-        if not token_ids or len(token_ids) != 2:
+    for market in candidates[:200]:
+        token_ids = parse_clob_token_ids(
+            market.get("clobTokenIds") or market.get("clob_token_ids")
+        )
+        if len(token_ids) != 2:
             continue
         token_a, token_b = str(token_ids[0]), str(token_ids[1])
         rest = RestClient(

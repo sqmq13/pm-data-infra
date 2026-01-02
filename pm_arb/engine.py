@@ -16,7 +16,7 @@ from .book import BookParseError, OrderBook, parse_ws_message
 from .clob_ws import build_subscribe_payload
 from .clob_rest import RestClient, RestError, fetch_book_with_retries, load_rest_book_fixture
 from .fixed import SIZE_SCALE, units_to_shares
-from .gamma import fetch_markets, load_markets_fixture
+from .gamma import fetch_markets, load_markets_fixture, parse_clob_token_ids
 from .reconcile import Reconciler
 from .sweep import sweep_cost
 
@@ -178,7 +178,12 @@ class Engine:
     def _load_markets(self) -> list[dict[str, Any]]:
         if self.config.offline:
             return load_markets_fixture(self.fixtures_dir / "gamma_markets.json")
-        return fetch_markets(self.config.gamma_base_url, self.config.rest_timeout)
+        return fetch_markets(
+            self.config.gamma_base_url,
+            self.config.rest_timeout,
+            limit=self.config.gamma_limit,
+            max_markets=self.config.max_markets,
+        )
 
     def _market_text(self, market: dict[str, Any]) -> str:
         return " ".join(
@@ -199,8 +204,10 @@ class Engine:
             active = market.get("active")
             if active is not None and not active:
                 continue
-            token_ids = market.get("clobTokenIds") or market.get("clob_token_ids")
-            if not token_ids or len(token_ids) != 2:
+            token_ids = parse_clob_token_ids(
+                market.get("clobTokenIds") or market.get("clob_token_ids")
+            )
+            if len(token_ids) != 2:
                 continue
             text = self._market_text(market)
             reasons: list[str] = []
@@ -220,8 +227,10 @@ class Engine:
             active = market.get("active")
             if active is not None and not active:
                 continue
-            token_ids = market.get("clobTokenIds") or market.get("clob_token_ids")
-            if not token_ids or len(token_ids) != 2:
+            token_ids = parse_clob_token_ids(
+                market.get("clobTokenIds") or market.get("clob_token_ids")
+            )
+            if len(token_ids) != 2:
                 continue
             text = self._market_text(market)
             reasons: list[str] = []
@@ -235,8 +244,10 @@ class Engine:
 
     def _init_states(self, markets: list[dict[str, Any]], now_ns: int) -> None:
         for market in markets:
-            token_ids = market.get("clobTokenIds") or market.get("clob_token_ids")
-            if not token_ids or len(token_ids) != 2:
+            token_ids = parse_clob_token_ids(
+                market.get("clobTokenIds") or market.get("clob_token_ids")
+            )
+            if len(token_ids) != 2:
                 continue
             token_a, token_b = str(token_ids[0]), str(token_ids[1])
             self.market_states[market.get("id", token_a + ":" + token_b)] = MarketState(
