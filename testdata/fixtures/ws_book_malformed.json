@@ -1,0 +1,14 @@
+[
+  {
+    "type": "book",
+    "asset_id": "tokenA",
+    "ts": 4000,
+    "asks": [{"price": "bad", "size": "10"}]
+  },
+  {
+    "type": "book",
+    "asset_id": "tokenB",
+    "ts": 4000,
+    "asks": [{"price": "0.45", "size": "-5"}]
+  }
+]

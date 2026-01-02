@@ -1,0 +1,22 @@
+[project]
+name = "pm-arb-py"
+version = "0.1.0"
+description = "Phase-1 Polymarket Strategy-A scanner"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31.0",
+  "websockets>=12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+pm_arb = "pm_arb.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0.0"]
+build-backend = "setuptools.build_meta"

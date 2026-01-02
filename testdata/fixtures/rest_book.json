@@ -1,0 +1,14 @@
+{
+  "tokenA": {
+    "asks": [{"price": "0.45", "size": "100"}]
+  },
+  "tokenB": {
+    "asks": [{"price": "0.45", "size": "100"}]
+  },
+  "tokenC": {
+    "asks": [{"price": "0.30", "size": "50"}]
+  },
+  "tokenD": {
+    "asks": [{"price": "0.70", "size": "50"}]
+  }
+}

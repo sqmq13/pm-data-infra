@@ -1,0 +1,20 @@
+[
+  {
+    "id": "mkt1",
+    "question": "Will BTC 15 minute price stay above 50000?",
+    "clobTokenIds": ["tokenA", "tokenB"],
+    "active": true
+  },
+  {
+    "id": "mkt2",
+    "question": "Will ETH 1 hour price stay above 3000?",
+    "clobTokenIds": ["tokenC", "tokenD"],
+    "active": true
+  },
+  {
+    "id": "mkt3",
+    "question": "SOL 15 minute move?",
+    "clobTokenIds": ["tokenE", "tokenF", "tokenG"],
+    "active": true
+  }
+]
