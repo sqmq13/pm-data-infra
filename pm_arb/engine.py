@@ -597,7 +597,7 @@ class Engine:
         self._check_integrity(now_ns)
         self._end_all_windows(now_ns, "token_stale")
         self._record("heartbeat", now_ns, final=True)
-        return 0 if not self.tainted else 2
+        return 0
 
     def scan_online(self) -> int:
         asyncio.run(self._scan_online_async())

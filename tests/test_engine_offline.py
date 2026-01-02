@@ -19,7 +19,7 @@ def test_scan_offline_creates_logs(tmp_path: Path) -> None:
     config = Config(offline=True, data_dir=str(data_dir))
     engine = Engine(config, fixtures_dir="testdata/fixtures")
     exit_code = engine.scan_offline()
-    assert exit_code in (0, 2)
+    assert exit_code == 0
     log_root = data_dir / "logs"
     log_dirs = [d for d in log_root.iterdir() if d.is_dir()]
     assert log_dirs

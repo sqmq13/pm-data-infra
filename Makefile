@@ -23,7 +23,7 @@ discover:
 	$(UV) run pm_arb discover
 
 run-offline:
-	$(UV) run pm_arb scan --offline
+	$(UV) run pm_arb scan --offline --fixtures-dir testdata/fixtures
 
 report-offline:
 	$(UV) run pm_arb report

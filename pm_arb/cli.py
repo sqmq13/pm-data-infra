@@ -49,7 +49,7 @@ def _add_config_args(parser: argparse.ArgumentParser) -> None:
                     dest=field.name,
                     nargs="?",
                     const=True,
-                    default=False,
+                    default=None,
                     type=_str2bool,
                 )
                 group.add_argument(f"--no-{name}", dest=field.name, action="store_false")
