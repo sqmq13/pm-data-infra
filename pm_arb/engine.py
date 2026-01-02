@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .book import BookParseError, OrderBook, parse_ws_message
-from .clob_ws import build_subscribe_payload
+from .clob_ws import build_handshake_payload
 from .clob_rest import RestClient, RestError, fetch_book_with_retries, load_rest_book_fixture
 from .fixed import SIZE_SCALE, units_to_shares
 from .gamma import fetch_markets, load_markets_fixture, parse_clob_token_ids
@@ -486,6 +486,10 @@ class Engine:
         return now_ns + int(self.config.resync_interval * 1_000_000_000)
 
     def _handle_ws_message(self, message: dict[str, Any], now_ns: int) -> None:
+        if isinstance(message, list):
+            for item in message:
+                self._handle_ws_message(item, now_ns)
+            return
         self.parse_total += 1
         try:
             token_id, asks, ts = parse_ws_message(message, price_scale=self.config.price_scale)
@@ -659,7 +663,7 @@ class Engine:
             },
         )
         asset_ids = sorted({t.token_id for t in self.token_states.values()})
-        payload = build_subscribe_payload("A", asset_ids)
+        payload = build_handshake_payload(asset_ids)
         queue: asyncio.Queue = asyncio.Queue()
         ws_task = asyncio.create_task(self._ws_reader(self.config.clob_ws_url, payload, queue))
         next_heartbeat = now_ns

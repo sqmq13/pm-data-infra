@@ -145,7 +145,6 @@ def contract_test_online(config: Config) -> int:
             for market in engine._discover_candidates(markets)
             if market.get("enableOrderBook") is not False
         ]
-    attempted_payloads: list[dict[str, Any]] = []
     for market in candidates[:200]:
         token_ids = parse_clob_token_ids(
             market.get("clobTokenIds") or market.get("clob_token_ids")
@@ -163,30 +162,30 @@ def contract_test_online(config: Config) -> int:
         book_b = fetch_book_with_retries(rest, token_b, config.rest_retry_max)
         if not book_a.get("asks") and not book_b.get("asks"):
             continue
-        payload_used = None
-        ws_msg = None
-        for variant in ("A", "B", "C"):
-            try:
-                timeout = min(5.0, float(config.contract_timeout))
-                payload_used, ws_msg = asyncio.run(
-                    wait_for_decodable_book(
-                        config.clob_ws_url,
-                        [token_a, token_b],
-                        variant,
-                        timeout,
-                        lambda msg: parse_ws_message(msg, price_scale=config.price_scale),
-                    )
+        try:
+            timeout = float(config.contract_timeout)
+            payload_used, ws_msg, attempted_payloads = asyncio.run(
+                wait_for_decodable_book(
+                    config.clob_ws_url,
+                    [token_a, token_b],
+                    timeout,
+                    lambda msg: parse_ws_message(msg, price_scale=config.price_scale),
                 )
-                attempted_payloads.append(payload_used)
-                break
-            except Exception as exc:
-                attempted_payloads.append({"variant": variant, "error": str(exc)})
-        if payload_used is None:
-            raise RuntimeError(f"WS contract failed; payloads attempted: {attempted_payloads}")
-        if ws_msg is not None:
-            _, asks, _ = parse_ws_message(ws_msg, price_scale=config.price_scale)
-            if not asks:
-                raise RuntimeError("WS contract failed: empty asks")
+            )
+        except Exception as exc:
+            raise RuntimeError(str(exc)) from exc
+        ws_keys: list[str] = []
+        if isinstance(ws_msg, list) and ws_msg:
+            first = ws_msg[0]
+            if isinstance(first, dict):
+                ws_keys = list(first.keys())
+        elif isinstance(ws_msg, dict):
+            ws_keys = list(ws_msg.keys())
+        _, asks, _ = parse_ws_message(ws_msg, price_scale=config.price_scale)
+        if not asks:
+            raise RuntimeError(
+                f"WS contract failed: empty asks; ws_url={config.clob_ws_url}; payloads={attempted_payloads}"
+            )
         recon = Reconciler(
             persist_n=config.reconcile_mismatch_persist_n,
             tick_tolerance=config.reconcile_tick_tolerance,
@@ -205,6 +204,7 @@ def contract_test_online(config: Config) -> int:
                     "token_a": token_a,
                     "token_b": token_b,
                     "payload": payload_used,
+                    "ws_keys": ws_keys,
                     "reconcile_desynced": result.desynced,
                 }
             ),

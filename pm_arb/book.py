@@ -39,8 +39,18 @@ def normalize_asks(asks: list[tuple[int, int]], top_k: int) -> list[tuple[int, i
 
 
 def parse_ws_message(
-    message: dict[str, Any], price_scale: int = PRICE_SCALE
+    message: Any, price_scale: int = PRICE_SCALE
 ) -> tuple[str, list[tuple[int, int]], int | None]:
+    if isinstance(message, list):
+        last_error: Exception | None = None
+        for item in message:
+            try:
+                return parse_ws_message(item, price_scale=price_scale)
+            except BookParseError as exc:
+                last_error = exc
+        raise BookParseError("no decodable book in list") from last_error
+    if not isinstance(message, dict):
+        raise BookParseError("invalid message type")
     asset_id = message.get("asset_id") or message.get("assetId") or message.get("token_id")
     if not asset_id:
         raise BookParseError("missing asset id")

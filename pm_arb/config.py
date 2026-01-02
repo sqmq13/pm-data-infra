@@ -30,7 +30,7 @@ class Config:
     gamma_base_url: str = "https://gamma-api.polymarket.com"
     gamma_limit: int = 100
     clob_rest_base_url: str = "https://clob.polymarket.com"
-    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/"
+    clob_ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
     geoblock_url: str = "https://polymarket.com/api/geoblock"
     markets_poll_interval: float = 20.0
     market_regex: str = (
