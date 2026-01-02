@@ -229,6 +229,7 @@ def main(argv: list[str] | None = None) -> int:
     contract.add_argument("--fixtures-dir", default="testdata/fixtures")
 
     discover = subparsers.add_parser("discover", parents=[common])
+    discover.add_argument("--only-matching", action="store_true", default=False)
 
     args = parser.parse_args(argv)
     overrides = _cli_overrides(args)
@@ -251,8 +252,13 @@ def main(argv: list[str] | None = None) -> int:
         engine = Engine(config)
         candidates = engine.discover()
         for market in candidates:
-            reasons = ",".join(market.get("_match_reasons", [])) or "no_match"
-            print(f"{market.get('id','unknown')}\t{reasons}\t{market.get('question','')}")
+            reasons = market.get("_match_reasons", [])
+            match_status = "match" if reasons else "no_match"
+            if args.only_matching and match_status == "no_match":
+                continue
+            slug = market.get("slug", "")
+            question = market.get("question", "")
+            print(f"{market.get('id','unknown')}\t{match_status}\t{slug}\t{question}")
         return 0
     return 1
 

@@ -190,6 +190,12 @@ class Engine:
             str(market.get(key, "")) for key in ("question", "title", "description", "slug")
         )
 
+    def _market_regex(self) -> re.Pattern[str]:
+        return re.compile(self.config.market_regex, re.MULTILINE)
+
+    def _regex_haystack(self, market: dict[str, Any]) -> str:
+        return f"{market.get('slug','')}\n{market.get('question','')}"
+
     def _secondary_match(self, text: str) -> bool:
         lower = text.lower()
         has_15 = "15" in lower
@@ -198,7 +204,7 @@ class Engine:
         return has_15 and has_min and has_asset
 
     def _filter_markets(self, markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        regex = re.compile(self.config.market_regex)
+        regex = self._market_regex()
         selected = []
         for market in markets:
             active = market.get("active")
@@ -210,8 +216,9 @@ class Engine:
             if len(token_ids) != 2:
                 continue
             text = self._market_text(market)
+            regex_haystack = self._regex_haystack(market)
             reasons: list[str] = []
-            if regex.search(text):
+            if regex.search(regex_haystack):
                 reasons.append("regex")
             if self.config.secondary_filter_enable and self._secondary_match(text):
                 reasons.append("secondary")
@@ -221,7 +228,7 @@ class Engine:
         return selected[: self.config.max_markets]
 
     def _discover_candidates(self, markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        regex = re.compile(self.config.market_regex)
+        regex = self._market_regex()
         candidates = []
         for market in markets:
             active = market.get("active")
@@ -233,8 +240,9 @@ class Engine:
             if len(token_ids) != 2:
                 continue
             text = self._market_text(market)
+            regex_haystack = self._regex_haystack(market)
             reasons: list[str] = []
-            if regex.search(text):
+            if regex.search(regex_haystack):
                 reasons.append("regex")
             if self.config.secondary_filter_enable and self._secondary_match(text):
                 reasons.append("secondary")
