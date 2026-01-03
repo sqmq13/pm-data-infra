@@ -13,12 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from .book import BookParseError, OrderBook, parse_ws_message
-from .clob_ws import build_handshake_payload
 from .clob_rest import RestClient, RestError, fetch_book_with_retries, load_rest_book_fixture
+from .clob_ws import build_handshake_payload
 from .fixed import SIZE_SCALE, units_to_shares
 from .gamma import fetch_markets, load_markets_fixture, parse_clob_token_ids
 from .reconcile import Reconciler
 from .sweep import sweep_cost
+from .ws_decode import decode_ws_raw
 
 SCHEMA_VERSION = 1
 
@@ -29,6 +30,7 @@ class TokenState:
     book: OrderBook
     last_update_ns: int | None = None
     last_msg_ts: int | None = None
+    last_book_ns: int | None = None
     updates_count: int = 0
     ooo_drops: int = 0
     missing_ts: int = 0
@@ -125,6 +127,14 @@ class Engine:
         self.parse_total = 0
         self.coverage_low_polls = 0
         self._disk_alarm_sent = False
+        self.ws_total_messages = 0
+        self.ws_pongs = 0
+        self.ws_empty_arrays = 0
+        self.ws_book_like = 0
+        self.ws_json_errors = 0
+        self.last_ws_nonpong_ns: int | None = None
+        self.last_ws_book_ns: int | None = None
+        self._book_ok_cache: dict[str, bool] = {}
         self.market_states: dict[str, MarketState] = {}
         self.token_states: dict[str, TokenState] = {}
         self.reconciler = Reconciler(
@@ -184,6 +194,41 @@ class Engine:
             limit=self.config.gamma_limit,
             max_markets=self.config.max_markets,
         )
+
+    def _book_ok(self, rest_client: RestClient, token_id: str) -> bool:
+        if token_id in self._book_ok_cache:
+            return self._book_ok_cache[token_id]
+        try:
+            data = rest_client.fetch_book(token_id)
+        except Exception:
+            self._book_ok_cache[token_id] = False
+            return False
+        ok = isinstance(data, dict) and "bids" in data and "asks" in data
+        self._book_ok_cache[token_id] = ok
+        return ok
+
+    def _filter_markets_by_book(self, markets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        rest_client = RestClient(
+            base_url=self.config.clob_rest_base_url,
+            timeout=self.config.rest_timeout,
+            rate_per_sec=self.config.rest_rate_per_sec,
+            burst=self.config.rest_burst,
+        )
+        filtered: list[dict[str, Any]] = []
+        for market in markets:
+            token_ids = parse_clob_token_ids(
+                market.get("clobTokenIds") or market.get("clob_token_ids")
+            )
+            if len(token_ids) != 2:
+                continue
+            if not self._book_ok(rest_client, token_ids[0]):
+                continue
+            if not self._book_ok(rest_client, token_ids[1]):
+                continue
+            filtered.append(market)
+            if len(filtered) >= self.config.max_markets:
+                break
+        return filtered
 
     def _market_text(self, market: dict[str, Any]) -> str:
         return " ".join(
@@ -421,8 +466,13 @@ class Engine:
                 continue
             if token.subscription_ns is None:
                 continue
-            if token.updates_count == 0:
-                if now_ns - token.subscription_ns > 30 * 1_000_000_000:
+            threshold_ns = 30 * 1_000_000_000
+            if token.last_book_ns is None:
+                if now_ns - token.subscription_ns > threshold_ns:
+                    token.no_feed = True
+                    self._alarm(now_ns, "no_feed", "no decodable book in 30s", token_id=token.token_id)
+            else:
+                if now_ns - token.last_book_ns > threshold_ns:
                     token.no_feed = True
                     self._alarm(now_ns, "no_feed", "no decodable book in 30s", token_id=token.token_id)
 
@@ -435,6 +485,11 @@ class Engine:
             ws_disconnected=self.ws_disconnected,
             tokens=len(self.token_states),
             markets=len(self.market_states),
+            ws_total_messages=self.ws_total_messages,
+            ws_pongs=self.ws_pongs,
+            ws_empty_arrays=self.ws_empty_arrays,
+            ws_book_like=self.ws_book_like,
+            ws_json_decode_errors=self.ws_json_errors,
         )
         return now_ns + int(self.config.heartbeat_interval * 1_000_000_000)
 
@@ -519,6 +574,7 @@ class Engine:
         token_state.last_msg_ts = ts if ts is not None else token_state.last_msg_ts
         token_state.book.update_from_asks(asks, self.config.top_k)
         token_state.last_update_ns = now_ns
+        token_state.last_book_ns = now_ns
         token_state.updates_count += 1
 
     def _evaluate_edges(self, now_ns: int) -> None:
@@ -645,20 +701,17 @@ class Engine:
                     await ws.send(json.dumps(payload))
                     while True:
                         raw = await ws.recv()
-                        if isinstance(raw, bytes):
-                            raw = raw.decode("utf-8", errors="ignore")
-                        try:
-                            msg = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        await queue.put(msg)
+                        await queue.put(raw)
             except Exception:
                 await asyncio.sleep(1.0)
 
     async def _scan_online_async(self) -> None:
         markets = self._load_markets()
         selected = self._filter_markets(markets)
+        if not self.config.offline:
+            selected = self._filter_markets_by_book(selected)
         now_ns = time.monotonic_ns()
+        self.last_ws_nonpong_ns = now_ns
         self.start_ns = now_ns
         self._init_states(selected, now_ns)
         self._geoblock_check(now_ns)
@@ -677,19 +730,33 @@ class Engine:
         next_heartbeat = now_ns
         next_reconcile = now_ns
         next_poll = now_ns
-        last_ws_ns = now_ns
         capture_path = Path(self.config.data_dir) / "debug" / "ws_samples.jsonl"
         capture_count = 0
         try:
             while True:
                 now_ns = time.monotonic_ns()
                 try:
-                    msg = await asyncio.wait_for(queue.get(), timeout=0.25)
-                    last_ws_ns = now_ns
-                    if capture_count < self.config.ws_sample_capture_n:
-                        self._capture_ws_sample(msg, capture_path, capture_count)
-                        capture_count += 1
-                    self._handle_ws_message(msg, now_ns)
+                    raw = await asyncio.wait_for(queue.get(), timeout=0.25)
+                    # WS payloads are often list-of-events, plus "PONG" and empty [] keepalives.
+                    self.ws_total_messages += 1
+                    decoded = decode_ws_raw(raw)
+                    if decoded.is_pong:
+                        self.ws_pongs += 1
+                    else:
+                        self.last_ws_nonpong_ns = now_ns
+                        if decoded.json_error:
+                            self.ws_json_errors += 1
+                        else:
+                            if decoded.empty_array:
+                                self.ws_empty_arrays += 1
+                            if decoded.book_items:
+                                self.ws_book_like += len(decoded.book_items)
+                                self.last_ws_book_ns = now_ns
+                                for item in decoded.book_items:
+                                    if capture_count < self.config.ws_sample_capture_n:
+                                        self._capture_ws_sample(item, capture_path, capture_count)
+                                        capture_count += 1
+                                    self._handle_ws_message(item, now_ns)
                     if self.config.sizes.strip().lower() == "auto":
                         self._collect_auto_sample()
                         self._maybe_freeze_sizes(now_ns, self.start_ns)
@@ -698,6 +765,8 @@ class Engine:
                     pass
                 if now_ns >= next_poll:
                     selected = self._filter_markets(self._load_markets())
+                    if not self.config.offline:
+                        selected = self._filter_markets_by_book(selected)
                     if len(selected) < 10:
                         self.coverage_low_polls += 1
                     else:
@@ -720,12 +789,18 @@ class Engine:
                         coverage_low_polls=self.coverage_low_polls,
                     )
                     next_poll = now_ns + int(self.config.markets_poll_interval * 1_000_000_000)
-                if now_ns - last_ws_ns > int(self.config.ws_disconnect_alarm_seconds * 1_000_000_000):
-                    if not self.ws_disconnect_alarm_sent:
-                        self.ws_disconnected = True
-                        self._alarm(now_ns, "ws_disconnected", "no ws messages")
-                        self._end_all_windows(now_ns, "ws_disconnected")
-                        self.ws_disconnect_alarm_sent = True
+                if self.last_ws_nonpong_ns is not None:
+                    if now_ns - self.last_ws_nonpong_ns > int(
+                        self.config.ws_disconnect_alarm_seconds * 1_000_000_000
+                    ):
+                        if not self.ws_disconnect_alarm_sent:
+                            self.ws_disconnected = True
+                            self._alarm(now_ns, "ws_disconnected", "no ws messages")
+                            self._end_all_windows(now_ns, "ws_disconnected")
+                            self.ws_disconnect_alarm_sent = True
+                    elif self.ws_disconnected:
+                        self.ws_disconnected = False
+                        self.ws_disconnect_alarm_sent = False
                 self._check_integrity(now_ns)
                 self._apply_status_endings(now_ns)
                 self._check_no_feed(now_ns)

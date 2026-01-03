@@ -8,6 +8,7 @@ from typing import Any
 
 import requests
 
+DEFAULT_USER_AGENT = "pm-arb-py/phase1"
 
 class RestError(RuntimeError):
     pass
@@ -41,11 +42,13 @@ class RestClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.limiter = RestRateLimiter(rate_per_sec=rate_per_sec, burst=burst)
+        self.session = requests.Session()
+        self.session.headers["User-Agent"] = DEFAULT_USER_AGENT
 
     def fetch_book(self, token_id: str) -> dict[str, Any]:
         self.limiter.allow()
         url = f"{self.base_url}/book"
-        resp = requests.get(url, params={"token_id": token_id}, timeout=self.timeout)
+        resp = self.session.get(url, params={"token_id": token_id}, timeout=self.timeout)
         resp.raise_for_status()
         return resp.json()
 

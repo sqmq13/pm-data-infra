@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+DEFAULT_USER_AGENT = "pm-arb-py/phase1"
+
 
 def parse_clob_token_ids(value: Any) -> list[str]:
     if value is None:
@@ -50,7 +52,12 @@ def fetch_markets(
         }
         if params_override:
             params.update(params_override)
-        resp = requests.get(url, params=params, timeout=timeout)
+        resp = requests.get(
+            url,
+            params=params,
+            timeout=timeout,
+            headers={"User-Agent": DEFAULT_USER_AGENT},
+        )
         resp.raise_for_status()
         data = resp.json()
         if isinstance(data, dict) and "markets" in data:

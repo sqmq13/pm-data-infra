@@ -20,10 +20,12 @@ from pm_arb.book import BookParseError, parse_ws_message
 from pm_arb.clob_ws import build_handshake_payload
 from pm_arb.engine import EventLogger, SCHEMA_VERSION
 from pm_arb.gamma import fetch_markets, parse_clob_token_ids
+from pm_arb.ws_decode import decode_ws_raw
 
 DEFAULT_MARKET_REGEX = r"(?i)^(btc|eth|sol|xrp)-updown-(5m|15m)-[0-9]+$"
 NO_FEED_SECONDS = 30.0
 BOOK_WINDOW_SECONDS = 30.0
+USER_AGENT = "pm-arb-py/base-scan"
 
 
 @dataclass
@@ -104,34 +106,6 @@ class Recorder:
         self.record("alarm", code=code, message=message, **fields)
 
 
-def _decode_book_tokens(payload: Any) -> list[str]:
-    tokens: list[str] = []
-    if isinstance(payload, list):
-        for item in payload:
-            try:
-                token_id, _, _ = parse_ws_message(item)
-                tokens.append(token_id)
-            except BookParseError:
-                continue
-        return tokens
-    if isinstance(payload, dict):
-        try:
-            token_id, _, _ = parse_ws_message(payload)
-            tokens.append(token_id)
-        except BookParseError:
-            pass
-    return tokens
-
-
-def _is_pong(payload: Any, raw: str | None = None) -> bool:
-    if isinstance(raw, str) and raw.lower() in {"pong", "ping"}:
-        return True
-    if isinstance(payload, dict):
-        msg_type = str(payload.get("type", "")).lower()
-        return msg_type in {"pong", "ping"}
-    return False
-
-
 def _fetch_book(session: requests.Session, base_url: str, token_id: str, timeout: float) -> tuple[bool, str]:
     url = f"{base_url.rstrip('/')}/book"
     try:
@@ -158,6 +132,7 @@ def _discover_and_validate(
     config: BaseScanConfig, regex: re.Pattern[str]
 ) -> tuple[list[str], dict[str, Any], list[tuple[str, str, bool, str]]]:
     session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
     markets = fetch_markets(
         config.gamma_base_url,
         config.rest_timeout,
@@ -304,22 +279,20 @@ async def _base_scan_loop(config: BaseScanConfig) -> int:
         raw = await ws_client.recv(timeout=0.2)
         if raw is not None:
             now = time.monotonic()
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8", errors="ignore")
-            payload = None
-            try:
-                payload = json.loads(raw)
-            except (TypeError, json.JSONDecodeError):
-                payload = None
-            if _is_pong(payload, raw=str(raw)):
+            # WS payloads are list-of-events; empty [] and "PONG" are keepalives.
+            decoded = decode_ws_raw(raw)
+            if decoded.is_pong:
                 pong_events.append(now)
-            else:
-                tokens = _decode_book_tokens(payload)
-                if tokens:
+            elif not decoded.json_error:
+                if decoded.book_items:
                     book_events.append(now)
                     last_book_any = now
-                    for token in tokens:
-                        last_book_by_token[token] = now
+                    for item in decoded.book_items:
+                        try:
+                            token_id, _, _ = parse_ws_message(item)
+                        except BookParseError:
+                            continue
+                        last_book_by_token[token_id] = now
                     no_feed_alarm_sent = False
 
         _prune_times(book_events, now, BOOK_WINDOW_SECONDS)
@@ -350,6 +323,33 @@ async def _base_scan_loop(config: BaseScanConfig) -> int:
         await asyncio.sleep(0.05)
 
 
+async def _probe_token(config: BaseScanConfig, token: str, timeout: float) -> int:
+    async with websockets.connect(config.clob_ws_url, ping_interval=20, ping_timeout=10) as ws:
+        await ws.send(json.dumps(build_handshake_payload([token])))
+        end = time.monotonic() + timeout
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                print("no book-like message received")
+                return 2
+            raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+            decoded = decode_ws_raw(raw)
+            if decoded.is_pong or decoded.json_error or decoded.empty_array:
+                continue
+            if decoded.book_items:
+                item = decoded.book_items[0]
+                try:
+                    token_id, asks, _ = parse_ws_message(item)
+                except BookParseError:
+                    continue
+                bids = item.get("bids", [])
+                keys = list(item.keys())
+                print(
+                    f"token={token_id}\tbids={len(bids)}\tasks={len(asks)}\tkeys={keys}"
+                )
+                return 0
+
+
 def _print_once(config: BaseScanConfig) -> int:
     regex = re.compile(config.market_regex)
     _, summary, details = _discover_and_validate(config, regex)
@@ -365,6 +365,7 @@ def _audit_http(
     config: BaseScanConfig, regex: re.Pattern[str], sample: int
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     session = requests.Session()
+    session.headers["User-Agent"] = USER_AGENT
     markets = fetch_markets(
         config.gamma_base_url,
         config.rest_timeout,
@@ -403,7 +404,10 @@ def _audit_http(
             resp = session.get(url, params={"token_id": token_id}, timeout=config.rest_timeout)
             if resp.status_code != 200:
                 status = "HTTP_ERROR"
-                reason = f"http_status:{resp.status_code}"
+                body = resp.text[:200].replace("\n", " ")
+                reason = f"http_status:{resp.status_code} body:{body}"
+                if resp.status_code in {403, 429} or resp.status_code >= 500:
+                    time.sleep(0.5)
             else:
                 try:
                     data = resp.json()
@@ -480,24 +484,26 @@ def _audit_ws_probe(
     def on_message(ws, message):
         now = time.time()
         raw_text = message.decode("utf-8", errors="ignore") if isinstance(message, bytes) else str(message)
-        payload = None
-        try:
-            payload = json.loads(raw_text)
-        except json.JSONDecodeError:
-            payload = None
+        decoded = decode_ws_raw(raw_text)
         with lock:
             stats["total_messages"] += 1
-            if _is_pong(payload, raw=raw_text):
+            if decoded.is_pong:
                 stats["pongs"] += 1
                 return
             if len(stats["samples"]) < 2:
                 stats["samples"].append(raw_text[:1000])
-            if isinstance(payload, list) and len(payload) == 0:
+            if decoded.json_error:
+                stats["errors"].append("json_decode_error")
+                return
+            if decoded.empty_array:
                 stats["empty_arrays"] += 1
-            tokens_found = _decode_book_tokens(payload)
-            if tokens_found:
-                stats["book_like"] += 1
-                for token_id in tokens_found:
+            if decoded.book_items:
+                stats["book_like"] += len(decoded.book_items)
+                for item in decoded.book_items:
+                    try:
+                        token_id, _, _ = parse_ws_message(item)
+                    except BookParseError:
+                        continue
                     stats["per_token_last_book_ts"][token_id] = now
 
     def on_error(ws, error):
@@ -605,6 +611,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", default=BaseScanConfig.data_dir)
     parser.add_argument("--heartbeat-interval", type=float, default=BaseScanConfig.heartbeat_interval)
     parser.add_argument("--print-once", action="store_true", default=False)
+    parser.add_argument("--probe-token")
+    parser.add_argument("--probe-timeout", type=float, default=10.0)
     parser.add_argument("--audit", action="store_true", default=False)
     parser.add_argument("--audit-seconds", type=int, default=30)
     parser.add_argument("--audit-sample", type=int, default=50)
@@ -627,6 +635,8 @@ def main(argv: list[str] | None = None) -> int:
         data_dir=args.data_dir,
         heartbeat_interval=args.heartbeat_interval,
     )
+    if args.probe_token:
+        return asyncio.run(_probe_token(config, args.probe_token, args.probe_timeout))
     if args.print_once:
         return _print_once(config)
     if args.audit:

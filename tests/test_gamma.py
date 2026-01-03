@@ -28,8 +28,8 @@ def test_fetch_markets_pagination(monkeypatch):
         def json(self):
             return {"markets": self._data}
 
-    def fake_get(url, params=None, timeout=None):
-        calls.append(params)
+    def fake_get(url, params=None, timeout=None, headers=None):
+        calls.append((params, headers))
         offset = params.get("offset", 0)
         data = pages.get(offset, [])
         return DummyResp(data)
@@ -40,9 +40,12 @@ def test_fetch_markets_pagination(monkeypatch):
     assert len(markets) == 3
     tokens = [gamma.parse_clob_token_ids(m["clobTokenIds"]) for m in markets]
     assert all(len(t) == 2 for t in tokens)
-    assert [call["offset"] for call in calls] == [0, 100, 200]
-    assert all(call["limit"] == 100 for call in calls)
-    assert all(call["closed"] == "false" for call in calls)
-    assert all(call["active"] == "true" for call in calls)
-    assert all(call["order"] == "id" for call in calls)
-    assert all(call["ascending"] == "false" for call in calls)
+    params_seen = [call[0] for call in calls]
+    headers_seen = [call[1] for call in calls]
+    assert [call["offset"] for call in params_seen] == [0, 100, 200]
+    assert all(call["limit"] == 100 for call in params_seen)
+    assert all(call["closed"] == "false" for call in params_seen)
+    assert all(call["active"] == "true" for call in params_seen)
+    assert all(call["order"] == "id" for call in params_seen)
+    assert all(call["ascending"] == "false" for call in params_seen)
+    assert all(call["User-Agent"] == gamma.DEFAULT_USER_AGENT for call in headers_seen)
