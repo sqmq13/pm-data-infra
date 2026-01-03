@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import random
 import re
@@ -693,6 +694,14 @@ class Engine:
         except Exception as exc:
             self._alarm(now_ns, "geoblock_check_failed", str(exc))
 
+    async def _ws_heartbeat(self, ws, interval_seconds: float) -> None:
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                await ws.send(json.dumps({"type": "ping"}))
+        except asyncio.CancelledError:
+            return
+
     async def _ws_reader(self, url: str, payload: dict[str, Any], queue: asyncio.Queue) -> None:
         while True:
             try:
@@ -703,9 +712,28 @@ class Engine:
                     if self.last_ws_rx_ns is None:
                         self.last_ws_rx_ns = time.monotonic_ns()
                     await ws.send(json.dumps(payload))
-                    while True:
-                        raw = await ws.recv()
-                        await queue.put(raw)
+                    heartbeat_task = asyncio.create_task(
+                        self._ws_heartbeat(ws, self.config.ws_ping_interval_seconds)
+                    )
+                    try:
+                        while True:
+                            try:
+                                raw = await asyncio.wait_for(
+                                    ws.recv(),
+                                    timeout=self.config.ws_read_timeout_seconds,
+                                )
+                            except asyncio.TimeoutError as exc:
+                                raise TimeoutError(
+                                    f"ws recv timeout after {self.config.ws_read_timeout_seconds}s"
+                                ) from exc
+                            await queue.put(raw)
+                    finally:
+                        heartbeat_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await heartbeat_task
+            except asyncio.CancelledError:
+                self.ws_connected = False
+                raise
             except Exception:
                 self.ws_connected = False
                 await asyncio.sleep(1.0)
@@ -814,6 +842,8 @@ class Engine:
                 next_reconcile = self._maybe_reconcile(now_ns, next_reconcile)
         finally:
             ws_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await ws_task
 
     def discover(self) -> list[dict[str, Any]]:
         markets = self._load_markets()

@@ -58,6 +58,16 @@ def decode_ws_raw(raw: Any) -> WsDecodeResult:
                 if _is_book_item(item):
                     book_items.append(item)
     elif isinstance(payload, dict):
+        msg_type = payload.get("type")
+        if isinstance(msg_type, str) and msg_type.lower() in {"ping", "pong"}:
+            return WsDecodeResult(
+                raw_text=raw_text,
+                payload=payload,
+                is_pong=True,
+                json_error=False,
+                empty_array=False,
+                book_items=[],
+            )
         if _is_book_item(payload):
             book_items.append(payload)
     return WsDecodeResult(

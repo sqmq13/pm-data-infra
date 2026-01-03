@@ -45,6 +45,8 @@ class Config:
     price_scale: int = PRICE_SCALE
     stale_seconds: float = 2.0
     ws_disconnect_alarm_seconds: float = 5.0
+    ws_ping_interval_seconds: float = 15.0
+    ws_read_timeout_seconds: float = 60.0
     resync_interval: float = 60.0
     rest_timeout: float = 10.0
     rest_snapshot_sample_min: int = 25
