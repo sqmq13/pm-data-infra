@@ -52,6 +52,14 @@ class Config:
     capture_ring_buffer_frames: int = 4096
     capture_metrics_max_samples: int = 5000
     capture_heartbeat_interval_seconds: float = 1.0
+    capture_universe_refresh_enable: bool = False
+    capture_universe_refresh_interval_seconds: float = 60.0
+    capture_universe_refresh_stagger_seconds: float = 0.25
+    capture_universe_refresh_grace_seconds: float = 30.0
+    capture_universe_refresh_min_delta_tokens: int = 2
+    capture_universe_refresh_max_churn_pct: float = 10.0
+    capture_universe_refresh_max_interval_seconds: float = 600.0
+    capture_universe_refresh_churn_guard_consecutive_fatal: int = 5
     data_dir: str = "./data"
     min_free_disk_gb: int = 5
     offline: bool = False

@@ -13,9 +13,31 @@ The selection order is preserved and then truncated to the configured max market
 
 ## Sharding
 
-- Markets are assigned to shards by stable market id hash.
-- Both outcome tokens for a market are always kept in the same shard.
-- Capture fails at startup if a token would be placed in more than one shard.
+- Tokens are assigned to shards by stable token id hash.
+- A given token id maps to exactly one shard for the run.
+- Shard assignment is deterministic and stable within the run.
+
+## Universe Refresh
+
+Universe refresh is disabled by default. When enabled, capture recomputes the desired universe on a fixed interval and applies only deltas:
+- tokens that no longer qualify are pruned,
+- newly qualifying tokens are added.
+
+Only shards whose target token sets changed reconnect, and reconnects are staggered. Newly added tokens are excluded from coverage calculations for the grace window (or until first seen). The churn guard backs off refresh frequency and can fail the run after sustained churn.
+
+Refresh disabled (baseline):
+```bash
+$env:PM_ARB_CAPTURE_UNIVERSE_REFRESH_ENABLE = "false"
+pm_arb capture --run-id baseline-<id>
+```
+
+Refresh enabled (60s interval, 30s grace):
+```bash
+$env:PM_ARB_CAPTURE_UNIVERSE_REFRESH_ENABLE = "true"
+$env:PM_ARB_CAPTURE_UNIVERSE_REFRESH_INTERVAL_SECONDS = "60"
+$env:PM_ARB_CAPTURE_UNIVERSE_REFRESH_GRACE_SECONDS = "30"
+pm_arb capture --run-id refresh-<id>
+```
 
 ## Run Bundle Layout
 

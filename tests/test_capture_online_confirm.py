@@ -10,6 +10,7 @@ from pm_arb.capture_format import FrameRecord
 from pm_arb.capture_online import (
     CaptureState,
     ShardState,
+    UniverseState,
     _check_backpressure_fatal,
     _confirm_event_from_payload,
     _handle_payload,
@@ -39,7 +40,20 @@ async def test_silent_universe_confirm_no_warmup_fatal(tmp_path):
         ring=deque(maxlen=5),
         confirmed=True,
     )
-    state = CaptureState(run=run, config=config, shards=[shard], pinned_tokens=["t1", "t2"])
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids={"t1", "t2"},
+        current_market_ids=set(),
+        token_added_mono_ns={},
+        shard_targets={},
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=["t1", "t2"],
+        universe=universe,
+    )
     task = asyncio.create_task(_heartbeat_loop(state))
     await asyncio.sleep(0.03)
     task.cancel()
@@ -80,7 +94,20 @@ async def test_backpressure_fatal_emits_missing_tokens(tmp_path, monkeypatch):
         idx_fh=idx_path.open("ab"),
         ring=deque(maxlen=5),
     )
-    state = CaptureState(run=run, config=config, shards=[shard], pinned_tokens=["t1", "t2"])
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids={"t1", "t2"},
+        current_market_ids=set(),
+        token_added_mono_ns={},
+        shard_targets={},
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=["t1", "t2"],
+        universe=universe,
+    )
 
     def slow_append_record(*args, **kwargs):
         time.sleep(0.001)

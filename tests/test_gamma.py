@@ -1,4 +1,5 @@
 from pm_arb import gamma
+from pm_arb.config import Config
 
 
 def test_parse_clob_token_ids_variants():
@@ -62,3 +63,42 @@ def test_fetch_markets_pagination(monkeypatch):
     assert all(call["order"] == "id" for call in params_seen)
     assert all(call["ascending"] == "false" for call in params_seen)
     assert all(call["User-Agent"] == gamma.DEFAULT_USER_AGENT for call in headers_seen)
+
+
+def test_compute_desired_universe_orders_and_filters(monkeypatch):
+    markets = [
+        {"id": "10", "active": True, "enableOrderBook": True, "clobTokenIds": ["a", "b"]},
+        {"id": "11", "active": False, "enableOrderBook": True, "clobTokenIds": ["c", "d"]},
+        {"id": "12", "active": True, "enableOrderBook": False, "clobTokenIds": ["e", "f"]},
+        {"id": "13", "active": True, "enableOrderBook": True, "clobTokenIds": ["g", "h", "i"]},
+        {"id": "9", "active": True, "enableOrderBook": True, "clobTokenIds": ["i", "j"]},
+    ]
+
+    def fake_fetch(*args, **kwargs):
+        return list(markets)
+
+    monkeypatch.setattr(gamma, "fetch_markets", fake_fetch)
+    config = Config(capture_max_markets=2)
+    snapshot = gamma.compute_desired_universe(config, universe_version=3)
+    assert snapshot.universe_version == 3
+    assert snapshot.market_ids == ["10", "9"]
+    assert snapshot.token_ids == ["a", "b", "i", "j"]
+    assert snapshot.selection["max_markets"] == 2
+    assert snapshot.selection["filters_enabled"] is False
+    assert snapshot.created_wall_ns_utc > 0
+    assert snapshot.created_mono_ns > 0
+
+
+def test_compute_desired_universe_preserves_order_non_numeric_ids(monkeypatch):
+    markets = [
+        {"id": "b", "active": True, "enableOrderBook": True, "clobTokenIds": ["a", "b"]},
+        {"id": "a", "active": True, "enableOrderBook": True, "clobTokenIds": ["c", "d"]},
+    ]
+
+    def fake_fetch(*args, **kwargs):
+        return list(markets)
+
+    monkeypatch.setattr(gamma, "fetch_markets", fake_fetch)
+    config = Config(capture_max_markets=10)
+    snapshot = gamma.compute_desired_universe(config)
+    assert snapshot.market_ids == ["b", "a"]

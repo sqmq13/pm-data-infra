@@ -1,53 +1,31 @@
 import orjson
-import pytest
 from collections import deque
 
 from pm_arb.capture_online import (
-    ShardAssignmentError,
     _extract_minimal_fields,
     _quantile_from_samples,
     _stable_hash,
-    assign_shards_by_market,
+    assign_shards_by_token,
     split_subscribe_groups,
 )
 from pm_arb.clob_ws import build_subscribe_payload
 
 
-def test_assign_shards_by_market_deterministic():
-    markets = [
-        {"id": "m1", "token_ids": ["tokenA", "tokenB"]},
-        {"id": "m2", "token_ids": ["tokenC", "tokenD"]},
-        {"id": "m3", "token_ids": ["tokenE", "tokenF"]},
-    ]
-    first, first_market_shards = assign_shards_by_market(markets, 3)
-    second, second_market_shards = assign_shards_by_market(markets, 3)
+def test_assign_shards_by_token_deterministic():
+    tokens = ["tokenA", "tokenB", "tokenC", "tokenD", "tokenE"]
+    first = assign_shards_by_token(tokens, 3)
+    second = assign_shards_by_token(tokens, 3)
     assert first == second
-    assert first_market_shards == second_market_shards
-    for market in markets:
-        shard_id = first_market_shards[str(market["id"])]
-        for token_id in market["token_ids"]:
-            assert token_id in first[shard_id]
+    for token_id in tokens:
+        shard_id = _stable_hash(token_id) % 3
+        assert token_id in first[shard_id]
 
 
-def test_assign_shards_by_market_token_conflict():
-    shard_count = 2
-    ids_by_shard: dict[int, str] = {}
-    for idx in range(1000):
-        market_id = f"m{idx}"
-        shard_id = _stable_hash(market_id) % shard_count
-        ids_by_shard.setdefault(shard_id, market_id)
-        if len(ids_by_shard) >= 2:
-            break
-    assert len(ids_by_shard) >= 2
-    shard_ids = sorted(ids_by_shard)
-    market_a = ids_by_shard[shard_ids[0]]
-    market_b = ids_by_shard[shard_ids[1]]
-    markets = [
-        {"id": market_a, "token_ids": ["tokenA", "tokenB"]},
-        {"id": market_b, "token_ids": ["tokenB", "tokenC"]},
-    ]
-    with pytest.raises(ShardAssignmentError):
-        assign_shards_by_market(markets, shard_count)
+def test_assign_shards_by_token_dedupes():
+    tokens = ["tokenA", "tokenB", "tokenA", "tokenC"]
+    shards = assign_shards_by_token(tokens, 2)
+    combined = [token for shard in shards.values() for token in shard]
+    assert combined.count("tokenA") == 1
 
 
 def test_split_subscribe_groups_limits():

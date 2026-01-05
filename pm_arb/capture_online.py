@@ -11,7 +11,7 @@ import struct
 import time
 from math import gcd
 from collections import deque
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -31,7 +31,13 @@ from .capture_format import (
 from .capture_offline import quantile
 from .clob_ws import build_subscribe_payload
 from .config import Config
-from .gamma import fetch_markets, parse_clob_token_ids, select_active_binary_markets
+from .gamma import (
+    UniverseSnapshot,
+    compute_desired_universe,
+    fetch_markets,
+    parse_clob_token_ids,
+    select_active_binary_markets,
+)
 
 SUBSCRIBE_VARIANTS = ("A", "B", "C")
 
@@ -42,9 +48,9 @@ FATAL_BACKPRESSURE = "BACKPRESSURE_STALL"
 FATAL_RECONNECT_STORM = "RECONNECT_STORM"
 FATAL_VERIFY = "VERIFY_CORRUPTION"
 FATAL_SUBSCRIBE_CONFIRM = "SUBSCRIBE_CONFIRM_FAIL"
-FATAL_SHARD_ASSIGNMENT = "SHARD_ASSIGNMENT_INVALID"
 FATAL_MONO_QUANTIZED = "MONO_TIME_QUANTIZED"
 FATAL_INTERNAL = "INTERNAL_ASSERT"
+FATAL_CHURN_GUARD = "CHURN_GUARD_SUSTAINED"
 
 
 @dataclass
@@ -82,6 +88,15 @@ class ShardStats:
 
 
 @dataclass
+class ShardTarget:
+    token_ids: list[str]
+    groups: list[list[str]]
+    confirm_token_ids: list[str] = field(default_factory=list)
+    refresh_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    target_version: int = 0
+
+
+@dataclass
 class ShardState:
     shard_id: int
     token_ids: list[str]
@@ -99,6 +114,28 @@ class ShardState:
     confirm_token_ids: list[str] = field(default_factory=list)
     confirm_events_seen: int = 0
     confirm_deadline_mono_ns: int | None = None
+    target: ShardTarget | None = None
+
+
+@dataclass
+class UniverseState:
+    universe_version: int
+    current_token_ids: set[str]
+    current_market_ids: set[str]
+    token_added_mono_ns: dict[str, int]
+    shard_targets: dict[int, ShardTarget]
+    refresh_task: asyncio.Task | None = None
+    refresh_cancelled: bool = False
+    effective_refresh_interval_seconds: float = 0.0
+    refresh_count: int = 0
+    refresh_failures: int = 0
+    refresh_churn_pct_last: float = 0.0
+    refresh_churn_guard_count: int = 0
+    refresh_skipped_delta_below_min_count: int = 0
+    refresh_last_decision_reason: str = "SKIPPED_NO_CHANGE"
+    tokens_added_last: int = 0
+    tokens_removed_last: int = 0
+    shards_refreshed_last: int = 0
 
 
 @dataclass
@@ -107,6 +144,7 @@ class CaptureState:
     config: Config
     shards: list[ShardState]
     pinned_tokens: list[str]
+    universe: UniverseState
     backpressure_breach_count: int = 0
     fatal_event: asyncio.Event = field(default_factory=asyncio.Event)
     fatal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -126,18 +164,21 @@ def _quantile_from_samples(samples: Iterable[int], percentile: float) -> int:
     return quantile(values, percentile)
 
 
-class ShardAssignmentError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        errors: list[dict[str, Any]],
-        shard_map: dict[int, list[str]],
-        market_shards: dict[str, int],
-    ) -> None:
-        super().__init__(message)
-        self.errors = errors
-        self.shard_map = shard_map
-        self.market_shards = market_shards
+def _apply_churn_guard_policy(
+    current_interval: float,
+    baseline_interval: float,
+    max_interval: float,
+    *,
+    guard_triggered: bool,
+    guard_count: int,
+    fatal_threshold: int,
+) -> tuple[float, int, bool]:
+    if guard_triggered:
+        base = current_interval if current_interval > 0 else baseline_interval
+        next_interval = min(max_interval, base * 2)
+        next_guard_count = guard_count + 1
+        return next_interval, next_guard_count, next_guard_count >= fatal_threshold
+    return baseline_interval, 0, False
 
 
 def _monotonic_precision_stats(sample_count: int) -> dict[str, Any]:
@@ -260,69 +301,22 @@ def _select_confirm_tokens(
     return ordered[: min(max_tokens, len(ordered))]
 
 
-def assign_shards_by_market(
-    markets: list[dict[str, Any]],
+def assign_shards_by_token(
+    token_ids: list[str],
     shard_count: int,
-) -> tuple[dict[int, list[str]], dict[str, int]]:
+) -> dict[int, list[str]]:
     if shard_count <= 0:
         raise ValueError("shard_count must be >= 1")
     shards: dict[int, list[str]] = {idx: [] for idx in range(shard_count)}
-    shard_sets: dict[int, set[str]] = {idx: set() for idx in range(shard_count)}
-    market_shards: dict[str, int] = {}
-    token_shards: dict[str, int] = {}
-    errors: list[dict[str, Any]] = []
-
-    for market in markets:
-        market_id = market.get("id")
-        if market_id is None:
-            errors.append({"error": "missing_market_id"})
+    seen: set[str] = set()
+    for token_id in token_ids:
+        token_key = str(token_id)
+        if token_key in seen:
             continue
-        market_key = str(market_id)
-        shard_id = _stable_hash(market_key) % shard_count
-        prior_market_shard = market_shards.get(market_key)
-        if prior_market_shard is not None and prior_market_shard != shard_id:
-            errors.append(
-                {
-                    "error": "market_multi_shard",
-                    "market_id": market_key,
-                    "first_shard": prior_market_shard,
-                    "second_shard": shard_id,
-                }
-            )
-            continue
-        market_shards[market_key] = shard_id
-
-        token_ids = market.get("token_ids") or market.get("tokenIds")
-        if not isinstance(token_ids, list) or len(token_ids) != 2:
-            errors.append(
-                {
-                    "error": "market_tokens_invalid",
-                    "market_id": market_key,
-                }
-            )
-            continue
-        for token_id in token_ids:
-            token_key = str(token_id)
-            prior_token_shard = token_shards.get(token_key)
-            if prior_token_shard is not None and prior_token_shard != shard_id:
-                errors.append(
-                    {
-                        "error": "token_multi_shard",
-                        "token_id": token_key,
-                        "first_shard": prior_token_shard,
-                        "second_shard": shard_id,
-                        "market_id": market_key,
-                    }
-                )
-                continue
-            token_shards[token_key] = shard_id
-            if token_key not in shard_sets[shard_id]:
-                shard_sets[shard_id].add(token_key)
-                shards[shard_id].append(token_key)
-
-    if errors:
-        raise ShardAssignmentError("invalid shard assignment", errors, shards, market_shards)
-    return shards, market_shards
+        seen.add(token_key)
+        shard_id = _stable_hash(token_key) % shard_count
+        shards[shard_id].append(token_key)
+    return shards
 
 
 def split_subscribe_groups(
@@ -347,6 +341,71 @@ def split_subscribe_groups(
     if current:
         groups.append(current)
     return groups
+
+
+def _sorted_unique_tokens(token_ids: Iterable[str]) -> list[str]:
+    return sorted({str(token_id) for token_id in token_ids if str(token_id)})
+
+
+def _compute_refresh_delta(
+    current_tokens: set[str],
+    desired_tokens: set[str],
+) -> tuple[set[str], set[str]]:
+    added = desired_tokens - current_tokens
+    removed = current_tokens - desired_tokens
+    return added, removed
+
+
+def _should_apply_refresh(
+    added: set[str],
+    removed: set[str],
+    min_delta_tokens: int,
+) -> bool:
+    return (len(added) + len(removed)) >= min_delta_tokens
+
+
+def _build_shard_targets(
+    token_ids: list[str],
+    config: Config,
+    *,
+    target_version: int,
+    scores: dict[str, float] | None = None,
+) -> dict[int, ShardTarget]:
+    ordered_tokens = _sorted_unique_tokens(token_ids)
+    shard_map = assign_shards_by_token(ordered_tokens, config.ws_shards)
+    if scores is None:
+        scores = {}
+    targets: dict[int, ShardTarget] = {}
+    for shard_id, tokens in shard_map.items():
+        groups = split_subscribe_groups(
+            tokens,
+            config.ws_subscribe_max_tokens,
+            config.ws_subscribe_max_bytes,
+            "A",
+        )
+        targets[shard_id] = ShardTarget(
+            token_ids=tokens,
+            groups=groups,
+            confirm_token_ids=_select_confirm_tokens(
+                tokens,
+                scores,
+                config.capture_confirm_tokens_per_shard,
+            ),
+            target_version=target_version,
+        )
+    return targets
+
+
+def _select_changed_shards(
+    current_targets: dict[int, ShardTarget],
+    next_targets: dict[int, ShardTarget],
+) -> dict[int, ShardTarget]:
+    changed: dict[int, ShardTarget] = {}
+    for shard_id, next_target in next_targets.items():
+        current = current_targets.get(shard_id)
+        if current is None or set(current.token_ids) != set(next_target.token_ids):
+            changed[shard_id] = next_target
+    return changed
 
 
 def _payload_bytes(raw: Any) -> tuple[bytes, int]:
@@ -439,22 +498,102 @@ def _load_pinned_markets(
     return selected, sorted(tokens), universe_mode, market_regex_effective, selected_markets
 
 
+def _snapshot_from_selected_markets(
+    config: Config,
+    selected_markets: list[dict[str, Any]],
+    *,
+    universe_version: int,
+) -> UniverseSnapshot:
+    market_ids: list[str] = []
+    token_ids: list[str] = []
+    token_seen: set[str] = set()
+    for market in selected_markets:
+        market_id = market.get("id")
+        if market_id is None:
+            continue
+        market_ids.append(str(market_id))
+        token_list = parse_clob_token_ids(
+            market.get("clobTokenIds") or market.get("clob_token_ids")
+        )
+        for token_id in token_list:
+            token_key = str(token_id)
+            if token_key in token_seen:
+                continue
+            token_seen.add(token_key)
+            token_ids.append(token_key)
+    return UniverseSnapshot(
+        universe_version=universe_version,
+        market_ids=market_ids,
+        token_ids=token_ids,
+        created_wall_ns_utc=time.time_ns(),
+        created_mono_ns=monotonic_ns(),
+        selection={
+            "max_markets": config.capture_max_markets,
+            "filters_enabled": False,
+        },
+    )
+
+
+def _load_startup_universe(
+    config: Config,
+) -> tuple[UniverseSnapshot, list[str], list[dict[str, Any]], list[dict[str, Any]], str]:
+    snapshot = compute_desired_universe(config, universe_version=1)
+    pinned_tokens = list(snapshot.token_ids)
+    universe_mode = "active-binary"
+    markets = fetch_markets(
+        config.gamma_base_url,
+        config.rest_timeout,
+        limit=config.gamma_limit,
+        max_markets=config.capture_max_markets,
+    )
+    selected_markets = select_active_binary_markets(
+        markets,
+        max_markets=config.capture_max_markets,
+    )
+    market_by_id = {
+        str(market["id"]): market
+        for market in selected_markets
+        if market.get("id") is not None
+    }
+    pinned_markets: list[dict[str, Any]] = []
+    ordered_selected_markets: list[dict[str, Any]] = []
+    for market_id in snapshot.market_ids:
+        market = market_by_id.get(str(market_id))
+        if market is None:
+            continue
+        token_ids = parse_clob_token_ids(
+            market.get("clobTokenIds") or market.get("clob_token_ids")
+        )
+        if len(token_ids) != 2:
+            continue
+        token_a, token_b = str(token_ids[0]), str(token_ids[1])
+        pinned_markets.append({"id": market_id, "token_ids": [token_a, token_b]})
+        ordered_selected_markets.append(market)
+    return snapshot, pinned_tokens, pinned_markets, ordered_selected_markets, universe_mode
+
+
 def _coverage_pct(
     token_ids: list[str],
     last_seen: dict[str, int],
     now_ns: int,
     window_ns: int | None,
+    *,
+    token_added_mono_ns: dict[str, int] | None = None,
+    grace_ns: int | None = None,
 ) -> float:
-    if not token_ids:
+    eligible = _eligible_token_ids(
+        token_ids, last_seen, token_added_mono_ns, now_ns, grace_ns
+    )
+    if not eligible:
         return 100.0
     seen = 0
-    for token_id in token_ids:
+    for token_id in eligible:
         ts = last_seen.get(token_id)
         if ts is None:
             continue
         if window_ns is None or now_ns - ts <= window_ns:
             seen += 1
-    return 100.0 * seen / len(token_ids)
+    return 100.0 * seen / len(eligible)
 
 
 def _missing_tokens(
@@ -462,15 +601,47 @@ def _missing_tokens(
     last_seen: dict[str, int],
     now_ns: int,
     window_ns: int | None,
+    *,
+    token_added_mono_ns: dict[str, int] | None = None,
+    grace_ns: int | None = None,
 ) -> list[dict[str, Any]]:
     missing: list[dict[str, Any]] = []
-    for token_id in token_ids:
+    eligible = _eligible_token_ids(
+        token_ids, last_seen, token_added_mono_ns, now_ns, grace_ns
+    )
+    for token_id in eligible:
         ts = last_seen.get(token_id)
         if ts is None:
             missing.append({"token_id": token_id, "last_seen_mono_ns": None})
         elif window_ns is not None and now_ns - ts > window_ns:
             missing.append({"token_id": token_id, "last_seen_mono_ns": ts})
     return missing
+
+
+def _eligible_token_ids(
+    token_ids: list[str],
+    last_seen: dict[str, int],
+    token_added_mono_ns: dict[str, int] | None,
+    now_ns: int,
+    grace_ns: int | None,
+) -> list[str]:
+    if not token_ids:
+        return []
+    if token_added_mono_ns is None or not token_added_mono_ns or not grace_ns or grace_ns <= 0:
+        return list(token_ids)
+    eligible: list[str] = []
+    to_remove: list[str] = []
+    for token_id in token_ids:
+        added_ns = token_added_mono_ns.get(token_id)
+        if added_ns is None:
+            eligible.append(token_id)
+            continue
+        if token_id in last_seen or now_ns - added_ns >= grace_ns:
+            eligible.append(token_id)
+            to_remove.append(token_id)
+    for token_id in to_remove:
+        token_added_mono_ns.pop(token_id, None)
+    return eligible
 
 
 def _confirm_event_from_payload(payload_bytes: bytes) -> tuple[bool, Any | None]:
@@ -567,7 +738,15 @@ def _build_missing_tokens_dump(
             "confirm_token_ids": shard.confirm_token_ids,
             "recent_headers": _ring_header_sample(shard, max_entries=10),
         }
-    missing_global = _missing_tokens(state.pinned_tokens, last_seen_global, now_ns, window_ns)
+    grace_ns = int(state.config.capture_universe_refresh_grace_seconds * 1_000_000_000)
+    missing_global = _missing_tokens(
+        state.pinned_tokens,
+        last_seen_global,
+        now_ns,
+        window_ns,
+        token_added_mono_ns=state.universe.token_added_mono_ns,
+        grace_ns=grace_ns,
+    )
     if include_missing_list:
         global_missing = missing_global
     else:
@@ -687,6 +866,7 @@ async def _trigger_fatal(
 async def _heartbeat_loop(state: CaptureState) -> None:
     interval_ns = int(state.config.capture_heartbeat_interval_seconds * 1_000_000_000)
     run_dir = state.run.run_dir
+    grace_ns = int(state.config.capture_universe_refresh_grace_seconds * 1_000_000_000)
     metrics_global = run_dir / "metrics" / "global.ndjson"
     metrics_shard_paths = {
         shard.shard_id: run_dir / "metrics" / f"shard_{shard.shard_id:02d}.ndjson"
@@ -742,6 +922,8 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 shard.last_seen,
                 now_ns,
                 None,
+                token_added_mono_ns=state.universe.token_added_mono_ns,
+                grace_ns=grace_ns,
             )
             shard_record = {
                 "record_type": "heartbeat",
@@ -792,6 +974,8 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 last_seen_global,
                 now_ns,
                 None,
+                token_added_mono_ns=state.universe.token_added_mono_ns,
+                grace_ns=grace_ns,
             )
 
         global_record = {
@@ -820,6 +1004,16 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "confirm_failures": global_confirm_failures,
             "decode_errors": global_decode_errors,
             "msg_type_counts": global_msg_type_counts,
+            "universe_version": state.universe.universe_version,
+            "refresh_count": state.universe.refresh_count,
+            "refresh_churn_pct_last": state.universe.refresh_churn_pct_last,
+            "tokens_added_last": state.universe.tokens_added_last,
+            "tokens_removed_last": state.universe.tokens_removed_last,
+            "shards_refreshed_last": state.universe.shards_refreshed_last,
+            "refresh_failures": state.universe.refresh_failures,
+            "refresh_interval_seconds_current": state.universe.effective_refresh_interval_seconds,
+            "refresh_skipped_delta_below_min_count": state.universe.refresh_skipped_delta_below_min_count,
+            "refresh_last_decision_reason": state.universe.refresh_last_decision_reason,
         }
         _write_metrics(metrics_global, global_record)
         state.heartbeat_samples.append(global_record)
@@ -959,17 +1153,249 @@ def _handle_payload(
     )
     for token_id in token_ids:
         shard.last_seen[token_id] = rx_mono_ns
+        if token_id in state.universe.token_added_mono_ns:
+            state.universe.token_added_mono_ns.pop(token_id, None)
+
+
+def _refresh_requested(shard: ShardState) -> bool:
+    return shard.target is not None and shard.target.refresh_requested.is_set()
+
+
+def _apply_shard_refresh(state: CaptureState, shard: ShardState) -> bool:
+    target = shard.target
+    if target is None or not target.refresh_requested.is_set():
+        return False
+    shard.token_ids = list(target.token_ids)
+    shard.groups = list(target.groups)
+    shard.confirm_token_ids = list(target.confirm_token_ids)
+    shard.confirmed = False
+    shard.confirm_events_seen = 0
+    shard.confirm_deadline_mono_ns = None
+    target.refresh_requested.clear()
+    _write_runlog(
+        state.run.run_dir,
+        {
+            "record_type": "shard_refresh_applied",
+            "run_id": state.run.run_id,
+            "shard_id": shard.shard_id,
+            "to_version": target.target_version,
+            "confirm_reset": True,
+            "confirm_events_seen": shard.confirm_events_seen,
+        },
+    )
+    return True
+
+
+async def _wait_for_refresh_or_fatal(state: CaptureState, shard: ShardState) -> None:
+    if shard.target is None:
+        await state.fatal_event.wait()
+        return
+    refresh_task = asyncio.create_task(shard.target.refresh_requested.wait())
+    fatal_task = asyncio.create_task(state.fatal_event.wait())
+    done, pending = await asyncio.wait(
+        [refresh_task, fatal_task],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _refresh_loop(state: CaptureState) -> None:
+    config = state.config
+    baseline_interval = config.capture_universe_refresh_interval_seconds
+    if baseline_interval <= 0:
+        return
+    if state.universe.effective_refresh_interval_seconds <= 0:
+        state.universe.effective_refresh_interval_seconds = baseline_interval
+    run_dir = state.run.run_dir
+    while not state.fatal_event.is_set() and not state.universe.refresh_cancelled:
+        await asyncio.sleep(state.universe.effective_refresh_interval_seconds)
+        if state.fatal_event.is_set() or state.universe.refresh_cancelled:
+            break
+        try:
+            snapshot = compute_desired_universe(
+                config,
+                universe_version=state.universe.universe_version + 1,
+            )
+            desired_tokens = set(snapshot.token_ids)
+            added, removed = _compute_refresh_delta(
+                state.universe.current_token_ids, desired_tokens
+            )
+            delta_count = len(added) + len(removed)
+            churn_pct = 100.0 * delta_count / max(1, len(state.universe.current_token_ids))
+            state.universe.refresh_churn_pct_last = churn_pct
+            state.universe.tokens_added_last = len(added)
+            state.universe.tokens_removed_last = len(removed)
+            if not _should_apply_refresh(
+                added,
+                removed,
+                config.capture_universe_refresh_min_delta_tokens,
+            ):
+                state.universe.refresh_skipped_delta_below_min_count += 1
+                state.universe.shards_refreshed_last = 0
+                if delta_count == 0:
+                    state.universe.refresh_last_decision_reason = "SKIPPED_NO_CHANGE"
+                else:
+                    state.universe.refresh_last_decision_reason = "SKIPPED_BELOW_MIN"
+                continue
+            guard_triggered = (
+                churn_pct > config.capture_universe_refresh_max_churn_pct
+            )
+            (
+                next_interval,
+                next_guard_count,
+                guard_fatal,
+            ) = _apply_churn_guard_policy(
+                state.universe.effective_refresh_interval_seconds,
+                baseline_interval,
+                config.capture_universe_refresh_max_interval_seconds,
+                guard_triggered=guard_triggered,
+                guard_count=state.universe.refresh_churn_guard_count,
+                fatal_threshold=config.capture_universe_refresh_churn_guard_consecutive_fatal,
+            )
+            state.universe.effective_refresh_interval_seconds = next_interval
+            state.universe.refresh_churn_guard_count = next_guard_count
+            if guard_triggered:
+                state.universe.shards_refreshed_last = 0
+                state.universe.refresh_last_decision_reason = "SKIPPED_CHURN_GUARD"
+                _write_runlog(
+                    run_dir,
+                    {
+                        "record_type": "universe_refresh",
+                        "run_id": state.run.run_id,
+                        "universe_version": snapshot.universe_version,
+                        "added_count": len(added),
+                        "removed_count": len(removed),
+                        "churn_pct": churn_pct,
+                        "interval_seconds_used": state.universe.effective_refresh_interval_seconds,
+                        "added_sample": sorted(added)[:10],
+                        "removed_sample": sorted(removed)[:10],
+                        "reason": "CHURN_GUARD",
+                    },
+                )
+                if guard_fatal:
+                    await _trigger_fatal(
+                        state,
+                        FATAL_CHURN_GUARD,
+                        "churn guard sustained",
+                    )
+                    break
+                continue
+            state.universe.refresh_churn_guard_count = 0
+            state.universe.refresh_last_decision_reason = "APPLIED"
+
+            selected_markets = select_active_binary_markets(
+                fetch_markets(
+                    config.gamma_base_url,
+                    config.rest_timeout,
+                    limit=config.gamma_limit,
+                    max_markets=config.capture_max_markets,
+                ),
+                max_markets=config.capture_max_markets,
+            )
+            scores = _token_score_map(selected_markets)
+            ordered_tokens = _sorted_unique_tokens(snapshot.token_ids)
+            next_targets = _build_shard_targets(
+                ordered_tokens,
+                config,
+                target_version=snapshot.universe_version,
+                scores=scores,
+            )
+            changed_targets = _select_changed_shards(
+                state.universe.shard_targets, next_targets
+            )
+
+            _write_runlog(
+                run_dir,
+                {
+                    "record_type": "universe_refresh",
+                    "run_id": state.run.run_id,
+                    "universe_version": snapshot.universe_version,
+                    "added_count": len(added),
+                    "removed_count": len(removed),
+                    "churn_pct": churn_pct,
+                    "interval_seconds_used": state.universe.effective_refresh_interval_seconds,
+                    "added_sample": sorted(added)[:10],
+                    "removed_sample": sorted(removed)[:10],
+                    "reason": "APPLIED",
+                },
+            )
+
+            state.universe.universe_version = snapshot.universe_version
+            state.universe.refresh_count += 1
+            state.universe.shards_refreshed_last = len(changed_targets)
+            state.universe.current_token_ids = desired_tokens
+            state.universe.current_market_ids = set(snapshot.market_ids)
+            now_ns = monotonic_ns()
+            for token_id in added:
+                state.universe.token_added_mono_ns[token_id] = now_ns
+            for token_id in removed:
+                state.universe.token_added_mono_ns.pop(token_id, None)
+            state.pinned_tokens = ordered_tokens
+
+            for shard_id, next_target in next_targets.items():
+                if state.universe.refresh_cancelled or state.fatal_event.is_set():
+                    break
+                current = state.universe.shard_targets.get(shard_id)
+                if current is None:
+                    state.universe.shard_targets[shard_id] = next_target
+                    current = next_target
+                if shard_id in changed_targets:
+                    _write_runlog(
+                        run_dir,
+                        {
+                            "record_type": "shard_refresh_begin",
+                            "run_id": state.run.run_id,
+                            "shard_id": shard_id,
+                            "from_version": current.target_version,
+                            "to_version": snapshot.universe_version,
+                            "from_token_count": len(current.token_ids),
+                            "to_token_count": len(next_target.token_ids),
+                        },
+                    )
+                    current.token_ids = next_target.token_ids
+                    current.groups = next_target.groups
+                    current.confirm_token_ids = next_target.confirm_token_ids
+                    current.target_version = snapshot.universe_version
+                    current.refresh_requested.set()
+                    await asyncio.sleep(config.capture_universe_refresh_stagger_seconds)
+                else:
+                    current.target_version = snapshot.universe_version
+        except asyncio.CancelledError:
+            state.universe.refresh_cancelled = True
+            break
+        except Exception as exc:
+            state.universe.refresh_failures += 1
+            state.universe.refresh_last_decision_reason = "ERROR"
+            _write_runlog(
+                run_dir,
+                {
+                    "record_type": "universe_refresh_error",
+                    "run_id": state.run.run_id,
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
 
 
 async def _run_shard(state: CaptureState, shard: ShardState) -> None:
     run_dir = state.run.run_dir
-    if not shard.token_ids:
-        await state.fatal_event.wait()
-        return
     variant_index = 0
     while not state.fatal_event.is_set():
+        if not shard.token_ids:
+            await _wait_for_refresh_or_fatal(state, shard)
+            if state.fatal_event.is_set():
+                break
+            _apply_shard_refresh(state, shard)
+            continue
+        if _refresh_requested(shard):
+            _apply_shard_refresh(state, shard)
+            continue
         variant = SUBSCRIBE_VARIANTS[variant_index % len(SUBSCRIBE_VARIANTS)]
         variant_index += 1
+        refresh_applied = False
         try:
             async with websockets.connect(state.config.clob_ws_url) as ws:
                 shard.confirmed = False
@@ -1021,6 +1447,10 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                     )
 
                 while not state.fatal_event.is_set():
+                    if _refresh_requested(shard):
+                        refresh_applied = _apply_shard_refresh(state, shard)
+                        await ws.close()
+                        break
                     await _check_confirm_deadline(monotonic_ns())
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
@@ -1038,6 +1468,8 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         rx_mono_ns=rx_mono_ns,
                         rx_wall_ns_utc=rx_wall_ns_utc,
                     )
+            if refresh_applied:
+                continue
         except Exception as exc:
             shard.reconnects += 1
             _write_runlog(
@@ -1063,34 +1495,22 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
 async def _capture_online_async(config: Config, run_id: str | None = None) -> int:
     if config.ws_shards <= 0:
         raise ValueError("ws_shards must be >= 1")
-    markets, pinned_tokens, universe_mode, _, selected_markets = _load_pinned_markets(
-        config
-    )
+    (
+        initial_snapshot,
+        pinned_tokens,
+        pinned_markets,
+        selected_markets,
+        universe_mode,
+    ) = _load_startup_universe(config)
     if not pinned_tokens:
         raise RuntimeError("no pinned tokens available for capture")
-    assignment_errors: list[dict[str, Any]] | None = None
-    market_shards: dict[str, int] = {}
-    try:
-        shard_map, market_shards = assign_shards_by_market(markets, config.ws_shards)
-    except ShardAssignmentError as exc:
-        shard_map = exc.shard_map
-        market_shards = exc.market_shards
-        assignment_errors = exc.errors
     scores = _token_score_map(selected_markets)
-    confirm_token_map = {
-        shard_id: _select_confirm_tokens(
-            tokens, scores, config.capture_confirm_tokens_per_shard
-        )
-        for shard_id, tokens in shard_map.items()
-    }
-    shard_groups: dict[int, list[list[str]]] = {}
-    for shard_id, tokens in shard_map.items():
-        shard_groups[shard_id] = split_subscribe_groups(
-            tokens,
-            config.ws_subscribe_max_tokens,
-            config.ws_subscribe_max_bytes,
-            "A",
-        )
+    shard_targets = _build_shard_targets(
+        pinned_tokens,
+        config,
+        target_version=initial_snapshot.universe_version,
+        scores=scores,
+    )
 
     manifest_extra = {
         "capture_schema_version": config.capture_frames_schema_version,
@@ -1102,13 +1522,23 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         "environment": _environment_metadata(),
         "config": _config_snapshot(config),
         "pinned_tokens": pinned_tokens,
-        "pinned_markets": markets,
-        "market_shards": market_shards,
+        "pinned_markets": pinned_markets,
+        "initial_universe": asdict(initial_snapshot),
+        "universe_refresh": {
+            "enabled": config.capture_universe_refresh_enable,
+            "interval_seconds": config.capture_universe_refresh_interval_seconds,
+            "stagger_seconds": config.capture_universe_refresh_stagger_seconds,
+            "grace_seconds": config.capture_universe_refresh_grace_seconds,
+            "min_delta_tokens": config.capture_universe_refresh_min_delta_tokens,
+            "max_churn_pct": config.capture_universe_refresh_max_churn_pct,
+            "max_interval_seconds": config.capture_universe_refresh_max_interval_seconds,
+            "churn_guard_consecutive_fatal": config.capture_universe_refresh_churn_guard_consecutive_fatal,
+        },
         "shards": {
             "count": config.ws_shards,
             "assignments": {
-                str(shard_id): {"token_ids": tokens, "groups": shard_groups[shard_id]}
-                for shard_id, tokens in shard_map.items()
+                str(shard_id): {"token_ids": target.token_ids, "groups": target.groups}
+                for shard_id, target in shard_targets.items()
             },
         },
         "subscribe_caps": {
@@ -1120,14 +1550,6 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
     run = bootstrap_run(config, run_id=run_id, manifest_extra=manifest_extra)
     run_dir = run.run_dir
     print(f"capture run dir: {run_dir}")
-    if assignment_errors:
-        _write_startup_fatal(
-            run,
-            FATAL_SHARD_ASSIGNMENT,
-            "invalid shard assignment",
-            extra={"shard_assignment_errors": assignment_errors},
-        )
-        return 1
 
     precision = _monotonic_precision_stats(sample_count=200)
     _write_runlog(
@@ -1147,7 +1569,7 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         )
         return 1
     shards: list[ShardState] = []
-    for shard_id, token_ids in shard_map.items():
+    for shard_id, target in shard_targets.items():
         frames_path = run_dir / "capture" / f"shard_{shard_id:02d}.frames"
         idx_path = run_dir / "capture" / f"shard_{shard_id:02d}.idx"
         frames_fh = frames_path.open("ab")
@@ -1156,18 +1578,33 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         shards.append(
             ShardState(
                 shard_id=shard_id,
-                token_ids=token_ids,
-                groups=shard_groups[shard_id],
+                token_ids=target.token_ids,
+                groups=target.groups,
                 frames_path=frames_path,
                 idx_path=idx_path,
                 frames_fh=frames_fh,
                 idx_fh=idx_fh,
                 ring=ring,
-                confirm_token_ids=confirm_token_map.get(shard_id, []),
+                confirm_token_ids=target.confirm_token_ids,
+                target=target,
             )
         )
-
-    state = CaptureState(run=run, config=config, shards=shards, pinned_tokens=pinned_tokens)
+    token_added_mono_ns: dict[str, int] = {}
+    universe_state = UniverseState(
+        universe_version=initial_snapshot.universe_version,
+        current_token_ids=set(initial_snapshot.token_ids),
+        current_market_ids=set(initial_snapshot.market_ids),
+        token_added_mono_ns=token_added_mono_ns,
+        shard_targets=shard_targets,
+        effective_refresh_interval_seconds=config.capture_universe_refresh_interval_seconds,
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=shards,
+        pinned_tokens=pinned_tokens,
+        universe=universe_state,
+    )
     _write_runlog(
         run_dir,
         {
@@ -1175,12 +1612,17 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
             "run_id": run.run_id,
             "shards": config.ws_shards,
             "token_count": len(pinned_tokens),
+            "universe_version": initial_snapshot.universe_version,
         },
     )
 
     tasks = [asyncio.create_task(_run_shard(state, shard)) for shard in shards]
     heartbeat_task = asyncio.create_task(_heartbeat_loop(state))
     tasks.append(heartbeat_task)
+    if config.capture_universe_refresh_enable:
+        refresh_task = asyncio.create_task(_refresh_loop(state))
+        state.universe.refresh_task = refresh_task
+        tasks.append(refresh_task)
 
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     if not state.fatal_event.is_set():
@@ -1193,6 +1635,7 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
                     f"task failed: {type(exc).__name__}",
                 )
                 break
+    state.universe.refresh_cancelled = True
     for task in pending:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
