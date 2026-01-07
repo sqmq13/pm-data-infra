@@ -8,6 +8,7 @@ import pytest
 from pm_arb.capture import RunBootstrap
 from pm_arb.capture import monotonic_ns
 from pm_arb.capture_format import FrameRecord
+import pm_arb.capture_online as capture_online
 from pm_arb.capture_online import (
     CaptureState,
     KEEPALIVE_PAYLOAD,
@@ -21,6 +22,80 @@ from pm_arb.capture_online import (
     _mark_reconnecting,
 )
 from pm_arb.config import Config
+
+
+class FakeWebSocket:
+    def __init__(self, recv_events, *, on_send=None, on_recv=None):
+        self._recv_events = deque(recv_events)
+        self._on_send = on_send
+        self._on_recv = on_recv
+        self.sent = []
+        self.closed = False
+
+    async def send(self, data):
+        self.sent.append(data)
+        if self._on_send:
+            self._on_send()
+
+    async def recv(self):
+        if not self._recv_events:
+            raise asyncio.TimeoutError
+        event = self._recv_events.popleft()
+        if isinstance(event, Exception):
+            raise event
+        if self._on_recv:
+            self._on_recv()
+        return event
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeConnect:
+    def __init__(self, ws):
+        self._ws = ws
+
+    async def __aenter__(self):
+        return self._ws
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+def _build_state(tmp_path, *, groups, config):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics").mkdir()
+    (run_dir / "capture").mkdir()
+    run = RunBootstrap("run", run_dir, 0, 0)
+    token_ids = [token for group in groups for token in group]
+    frames_path = run_dir / "capture" / "shard_00.frames"
+    idx_path = run_dir / "capture" / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=token_ids,
+        groups=groups,
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=5),
+    )
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids=set(token_ids),
+        current_market_ids=set(),
+        token_added_mono_ns={},
+        shard_targets={},
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=token_ids,
+        universe=universe,
+    )
+    return state, shard, run_dir
 
 
 @pytest.mark.asyncio
@@ -73,6 +148,141 @@ def test_confirm_event_ignores_keepalive_then_confirms():
     confirm, payload = _confirm_event_from_payload(b'{"event_type":"book"}')
     assert confirm is True
     assert isinstance(payload, dict)
+
+
+@pytest.mark.asyncio
+async def test_confirm_success_logs_variant_from_subscribe_attempt(tmp_path, monkeypatch):
+    config = Config(capture_confirm_min_events=1, ws_reconnect_backoff_seconds=0.0)
+    groups = [["t1"], ["t2"]]
+    state, shard, run_dir = _build_state(tmp_path, groups=groups, config=config)
+    ws = FakeWebSocket(
+        [b'{"event_type":"book","asset_id":"t1"}'],
+        on_recv=state.stop_event.set,
+    )
+    monkeypatch.setattr(
+        capture_online.websockets,
+        "connect",
+        lambda *args, **kwargs: FakeConnect(ws),
+    )
+
+    await asyncio.wait_for(capture_online._run_shard(state, shard), timeout=2.0)
+
+    records = [
+        json.loads(line)
+        for line in (run_dir / "runlog.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    attempt_variants = [
+        record["variant"]
+        for record in records
+        if record.get("record_type") == "subscribe_attempt"
+    ]
+    confirm_records = [
+        record
+        for record in records
+        if record.get("record_type") == "subscribe_confirm_success"
+    ]
+    assert attempt_variants
+    assert confirm_records
+    assert confirm_records[-1]["variant"] == attempt_variants[-1]
+    assert confirm_records[-1]["group_index"] == len(groups) - 1
+    assert shard.subscribe_variant_locked == attempt_variants[-1]
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
+async def test_variant_sticky_after_confirm_reconnect(tmp_path, monkeypatch):
+    config = Config(capture_confirm_min_events=1, ws_reconnect_backoff_seconds=0.0)
+    groups = [["t1"]]
+    state, shard, run_dir = _build_state(tmp_path, groups=groups, config=config)
+    first_ws = FakeWebSocket(
+        [b'{"event_type":"book","asset_id":"t1"}', RuntimeError("closed")],
+    )
+    second_ws = FakeWebSocket([asyncio.TimeoutError()], on_send=state.stop_event.set)
+    connections = deque([first_ws, second_ws])
+
+    def fake_connect(*args, **kwargs):
+        if not connections:
+            raise AssertionError("unexpected websocket connect")
+        return FakeConnect(connections.popleft())
+
+    monkeypatch.setattr(capture_online.websockets, "connect", fake_connect)
+
+    await asyncio.wait_for(capture_online._run_shard(state, shard), timeout=2.0)
+
+    records = [
+        json.loads(line)
+        for line in (run_dir / "runlog.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    attempt_records = [
+        record for record in records if record.get("record_type") == "subscribe_attempt"
+    ]
+    assert len(attempt_records) >= 2
+    first_variant = attempt_records[0]["variant"]
+    assert all(record["variant"] == first_variant for record in attempt_records)
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
+async def test_confirm_deadline_miss_rotates_variant(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "metrics").mkdir()
+    (run_dir / "capture").mkdir()
+    run = RunBootstrap("run", run_dir, 0, 0)
+    config = Config()
+    frames_path = run_dir / "capture" / "shard_00.frames"
+    idx_path = run_dir / "capture" / "shard_00.idx"
+    shard = ShardState(
+        shard_id=0,
+        token_ids=["t1"],
+        groups=[],
+        frames_path=frames_path,
+        idx_path=idx_path,
+        frames_fh=frames_path.open("ab"),
+        idx_fh=idx_path.open("ab"),
+        ring=deque(maxlen=5),
+        confirmed=False,
+        subscribe_variant_locked="B",
+        subscribe_variant_index=0,
+    )
+    universe = UniverseState(
+        universe_version=1,
+        current_token_ids={"t1"},
+        current_market_ids=set(),
+        token_added_mono_ns={},
+        shard_targets={},
+    )
+    state = CaptureState(
+        run=run,
+        config=config,
+        shards=[shard],
+        pinned_tokens=["t1"],
+        universe=universe,
+    )
+
+    with pytest.raises(TimeoutError):
+        await _handle_confirm_deadline_miss(
+            state,
+            shard,
+            variant="B",
+            now_ns=monotonic_ns(),
+        )
+
+    assert shard.subscribe_variant_index == 1
+    assert shard.subscribe_variant_locked is None
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
 
 
 @pytest.mark.asyncio

@@ -127,6 +127,8 @@ class ShardState:
     target: ShardTarget | None = None
     last_subscribe_variant: str | None = None
     last_subscribe_group_index: int | None = None
+    subscribe_variant_locked: str | None = None
+    subscribe_variant_index: int = 0
 
 
 @dataclass
@@ -1093,6 +1095,9 @@ async def _handle_confirm_deadline_miss(
     now_ns: int,
 ) -> None:
     shard.confirm_failures += 1
+    shard.subscribe_variant_index += 1
+    if shard.subscribe_variant_locked == variant:
+        shard.subscribe_variant_locked = None
     _write_runlog(
         state.run.run_dir,
         {
@@ -1439,15 +1444,29 @@ def _handle_payload(
             shard.confirm_events_seen >= state.config.capture_confirm_min_events
         ):
             shard.confirmed = True
+            if shard.last_subscribe_variant is not None:
+                shard.subscribe_variant_locked = shard.last_subscribe_variant
+            variant = shard.last_subscribe_variant
+            if variant is None:
+                variant = shard.subscribe_variant_locked
+                if variant is None:
+                    variant = SUBSCRIBE_VARIANTS[
+                        shard.subscribe_variant_index % len(SUBSCRIBE_VARIANTS)
+                    ]
+                shard.last_subscribe_variant = variant
+            runlog_record = {
+                "record_type": "subscribe_confirm_success",
+                "run_id": state.run.run_id,
+                "shard_id": shard.shard_id,
+                "confirm_events_seen": shard.confirm_events_seen,
+                "confirm_deadline_mono_ns": shard.confirm_deadline_mono_ns,
+                "variant": variant,
+            }
+            if shard.last_subscribe_group_index is not None:
+                runlog_record["group_index"] = shard.last_subscribe_group_index
             _write_runlog(
                 state.run.run_dir,
-                {
-                    "record_type": "subscribe_confirm_success",
-                    "run_id": state.run.run_id,
-                    "shard_id": shard.shard_id,
-                    "confirm_events_seen": shard.confirm_events_seen,
-                    "confirm_deadline_mono_ns": shard.confirm_deadline_mono_ns,
-                },
+                runlog_record,
             )
 
     shard.ring.append(header_bytes + record.payload)
@@ -1828,7 +1847,6 @@ async def _refresh_loop(state: CaptureState) -> None:
 
 async def _run_shard(state: CaptureState, shard: ShardState) -> None:
     run_dir = state.run.run_dir
-    variant_index = 0
     while not state.fatal_event.is_set() and not state.stop_event.is_set():
         if not shard.token_ids:
             await _wait_for_refresh_or_fatal(state, shard)
@@ -1839,12 +1857,18 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
         if _refresh_requested(shard):
             _apply_shard_refresh(state, shard)
             continue
-        variant = SUBSCRIBE_VARIANTS[variant_index % len(SUBSCRIBE_VARIANTS)]
-        variant_index += 1
+        if shard.subscribe_variant_locked:
+            variant = shard.subscribe_variant_locked
+        else:
+            variant = SUBSCRIBE_VARIANTS[
+                shard.subscribe_variant_index % len(SUBSCRIBE_VARIANTS)
+            ]
         refresh_applied = False
         try:
             async with websockets.connect(state.config.clob_ws_url) as ws:
                 _mark_reconnecting(shard)
+                shard.last_subscribe_variant = variant
+                shard.last_subscribe_group_index = None
                 shard.confirm_deadline_mono_ns = (
                     monotonic_ns()
                     + int(state.config.capture_confirm_timeout_seconds * 1_000_000_000)
