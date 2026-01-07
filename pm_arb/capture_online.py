@@ -6,6 +6,7 @@ import hashlib
 import os
 import platform
 import shutil
+import signal
 import socket
 import struct
 import time
@@ -170,6 +171,8 @@ class CaptureState:
     fee_rate_client: FeeRateClient | None = None
     policy_selector: PolicySelector | None = None
     fee_regime_monitor: FeeRegimeMonitor | None = None
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    stop_reason: str | None = None
     backpressure_breach_count: int = 0
     fatal_event: asyncio.Event = field(default_factory=asyncio.Event)
     fatal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -414,6 +417,25 @@ def _environment_metadata() -> dict[str, str]:
         "platform": platform.platform(),
         "hostname": socket.gethostname(),
     }
+
+
+def _install_signal_handlers(state: CaptureState) -> None:
+    loop = asyncio.get_running_loop()
+
+    def _request_stop(sig: signal.Signals) -> None:
+        if state.stop_event.is_set():
+            return
+        state.stop_reason = sig.name
+        loop.call_soon_threadsafe(state.stop_event.set)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _request_stop, sig)
+        except (NotImplementedError, RuntimeError):
+            try:
+                signal.signal(sig, lambda *_args, _sig=sig: _request_stop(_sig))
+            except (ValueError, AttributeError):
+                continue
 
 
 def _build_fee_rate_client(config: Config) -> FeeRateClient:
@@ -891,9 +913,12 @@ def _eligible_token_ids(
     return eligible
 
 
+KEEPALIVE_PAYLOAD = object()
+
+
 def _confirm_event_from_payload(payload_bytes: bytes) -> tuple[bool, Any | None]:
     if payload_bytes in (b"PONG", b"PING"):
-        return False, []
+        return False, KEEPALIVE_PAYLOAD
     try:
         payload = orjson.loads(payload_bytes)
     except orjson.JSONDecodeError:
@@ -1173,7 +1198,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         for shard in state.shards
     }
     next_tick = state.run.t0_mono_ns + interval_ns
-    while not state.fatal_event.is_set():
+    while not state.fatal_event.is_set() and not state.stop_event.is_set():
         now_ns = monotonic_ns()
         if now_ns < next_tick:
             await asyncio.sleep((next_tick - now_ns) / 1_000_000_000)
@@ -1349,7 +1374,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             now_ns,
             global_record["backpressure_ns_p99"],
         )
-        if state.fatal_event.is_set():
+        if state.fatal_event.is_set() or state.stop_event.is_set():
             break
 
         if state.config.min_free_disk_gb is not None:
@@ -1407,8 +1432,6 @@ def _handle_payload(
             record.payload_len,
             record.payload_crc32,
         )
-    shard.ring.append(header_bytes + record.payload)
-
     confirm_event, payload = _confirm_event_from_payload(payload_bytes)
     if confirm_event:
         shard.confirm_events_seen += 1
@@ -1426,6 +1449,22 @@ def _handle_payload(
                     "confirm_deadline_mono_ns": shard.confirm_deadline_mono_ns,
                 },
             )
+
+    shard.ring.append(header_bytes + record.payload)
+
+    if payload is KEEPALIVE_PAYLOAD:
+        shard.stats.record(
+            record.payload_len,
+            frames_header_len(record.schema_version),
+            idx_entry_len(record.schema_version),
+            write_end_ns - write_start_ns,
+            write_end_ns - rx_mono_ns,
+            backpressure_ns,
+            [],
+            {},
+            state.config.capture_metrics_max_samples,
+        )
+        return
 
     if payload is None:
         shard.stats.decode_errors += 1
@@ -1490,12 +1529,19 @@ def _apply_shard_refresh(state: CaptureState, shard: ShardState) -> bool:
 
 async def _wait_for_refresh_or_fatal(state: CaptureState, shard: ShardState) -> None:
     if shard.target is None:
-        await state.fatal_event.wait()
+        await asyncio.wait(
+            [
+                asyncio.create_task(state.fatal_event.wait()),
+                asyncio.create_task(state.stop_event.wait()),
+            ],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
         return
     refresh_task = asyncio.create_task(shard.target.refresh_requested.wait())
     fatal_task = asyncio.create_task(state.fatal_event.wait())
+    stop_task = asyncio.create_task(state.stop_event.wait())
     done, pending = await asyncio.wait(
-        [refresh_task, fatal_task],
+        [refresh_task, fatal_task, stop_task],
         return_when=asyncio.FIRST_COMPLETED,
     )
     for task in pending:
@@ -1519,9 +1565,17 @@ async def _refresh_loop(state: CaptureState) -> None:
     if state.fee_regime_monitor is None:
         state.fee_regime_monitor = _build_fee_regime_monitor(config)
     canary_tokens = _parse_canary_tokens(config.fee_regime_canary_token_ids)
-    while not state.fatal_event.is_set() and not state.universe.refresh_cancelled:
+    while (
+        not state.fatal_event.is_set()
+        and not state.stop_event.is_set()
+        and not state.universe.refresh_cancelled
+    ):
         await asyncio.sleep(state.universe.effective_refresh_interval_seconds)
-        if state.fatal_event.is_set() or state.universe.refresh_cancelled:
+        if (
+            state.fatal_event.is_set()
+            or state.stop_event.is_set()
+            or state.universe.refresh_cancelled
+        ):
             break
         try:
             snapshot = compute_desired_universe(
@@ -1718,9 +1772,17 @@ async def _refresh_loop(state: CaptureState) -> None:
             for token_id in removed:
                 state.universe.token_added_mono_ns.pop(token_id, None)
             state.pinned_tokens = ordered_tokens
+            if removed:
+                for shard in state.shards:
+                    for token_id in removed:
+                        shard.last_seen.pop(token_id, None)
 
             for shard_id, next_target in next_targets.items():
-                if state.universe.refresh_cancelled or state.fatal_event.is_set():
+                if (
+                    state.universe.refresh_cancelled
+                    or state.fatal_event.is_set()
+                    or state.stop_event.is_set()
+                ):
                     break
                 current = state.universe.shard_targets.get(shard_id)
                 if current is None:
@@ -1767,10 +1829,10 @@ async def _refresh_loop(state: CaptureState) -> None:
 async def _run_shard(state: CaptureState, shard: ShardState) -> None:
     run_dir = state.run.run_dir
     variant_index = 0
-    while not state.fatal_event.is_set():
+    while not state.fatal_event.is_set() and not state.stop_event.is_set():
         if not shard.token_ids:
             await _wait_for_refresh_or_fatal(state, shard)
-            if state.fatal_event.is_set():
+            if state.fatal_event.is_set() or state.stop_event.is_set():
                 break
             _apply_shard_refresh(state, shard)
             continue
@@ -1819,9 +1881,12 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         },
                     )
 
-                while not state.fatal_event.is_set():
+                while not state.fatal_event.is_set() and not state.stop_event.is_set():
                     if _refresh_requested(shard):
                         refresh_applied = _apply_shard_refresh(state, shard)
+                        await ws.close()
+                        break
+                    if state.stop_event.is_set():
                         await ws.close()
                         break
                     await _check_confirm_deadline(monotonic_ns())
@@ -1844,6 +1909,8 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
             if refresh_applied:
                 continue
         except Exception as exc:
+            if state.stop_event.is_set():
+                break
             _mark_reconnecting(shard)
             shard.reconnects += 1
             _write_runlog(
@@ -2023,6 +2090,7 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         policy_selector=policy_selector,
         fee_regime_monitor=fee_regime_monitor,
     )
+    _install_signal_handlers(state)
     _write_runlog(
         run_dir,
         {
@@ -2041,8 +2109,19 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         refresh_task = asyncio.create_task(_refresh_loop(state))
         state.universe.refresh_task = refresh_task
         tasks.append(refresh_task)
+    stop_task = asyncio.create_task(state.stop_event.wait())
+    tasks.append(stop_task)
 
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    if state.stop_event.is_set() and not state.fatal_event.is_set():
+        _write_runlog(
+            run_dir,
+            {
+                "record_type": "capture_stop",
+                "run_id": state.run.run_id,
+                "reason": state.stop_reason or "signal",
+            },
+        )
     if not state.fatal_event.is_set():
         for task in done:
             exc = task.exception()

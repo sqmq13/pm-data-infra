@@ -10,6 +10,7 @@ from pm_arb.capture import monotonic_ns
 from pm_arb.capture_format import FrameRecord
 from pm_arb.capture_online import (
     CaptureState,
+    KEEPALIVE_PAYLOAD,
     ShardState,
     UniverseState,
     _check_backpressure_fatal,
@@ -68,7 +69,7 @@ async def test_silent_universe_confirm_no_warmup_fatal(tmp_path):
 def test_confirm_event_ignores_keepalive_then_confirms():
     keepalive_confirm, keepalive_payload = _confirm_event_from_payload(b"PONG")
     assert keepalive_confirm is False
-    assert keepalive_payload == []
+    assert keepalive_payload is KEEPALIVE_PAYLOAD
     confirm, payload = _confirm_event_from_payload(b'{"event_type":"book"}')
     assert confirm is True
     assert isinstance(payload, dict)

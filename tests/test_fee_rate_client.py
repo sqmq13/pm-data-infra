@@ -1,3 +1,4 @@
+import asyncio
 import threading
 import time
 
@@ -141,3 +142,30 @@ async def test_fee_rate_client_bounded_concurrency():
     tokens = [f"t{i}" for i in range(10)]
     await client.prefetch_fee_rates(tokens, timeout_seconds=1.0, max_tokens=10)
     assert stats["max_seen"] <= 2
+
+
+@pytest.mark.asyncio
+async def test_fee_rate_client_inflight_dedup_on_error():
+    gate = threading.Event()
+    calls = {"count": 0}
+
+    def fetcher(_token_id: str) -> int:
+        calls["count"] += 1
+        gate.wait(0.05)
+        raise RuntimeError("boom")
+
+    client = FeeRateClient(
+        base_url="https://clob.polymarket.com",
+        timeout_seconds=1.0,
+        cache_ttl_seconds=1.0,
+        max_in_flight=1,
+        fetcher=fetcher,
+    )
+    task1 = asyncio.create_task(client.get_fee_rate("t1"))
+    await asyncio.sleep(0)
+    task2 = asyncio.create_task(client.get_fee_rate("t1"))
+    gate.set()
+    result1, result2 = await asyncio.gather(task1, task2)
+    assert calls["count"] == 1
+    assert result1.fee_rate_known is False
+    assert result2.fee_rate_known is False
