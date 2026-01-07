@@ -168,7 +168,6 @@ class CaptureState:
     shards: list[ShardState]
     pinned_tokens: list[str]
     universe: UniverseState
-    subscribe_semaphore: asyncio.Semaphore | None = None
     fee_rate_client: FeeRateClient | None = None
     policy_selector: PolicySelector | None = None
     fee_regime_monitor: FeeRegimeMonitor | None = None
@@ -448,21 +447,6 @@ def _build_fee_rate_client(config: Config) -> FeeRateClient:
     )
 
 
-async def _prefetch_initial_fee_rates(
-    config: Config,
-    fee_rate_client: FeeRateClient | None,
-    token_ids: list[str],
-) -> dict[str, Any]:
-    if fee_rate_client is None or not token_ids:
-        return {}
-    await fee_rate_client.prefetch_fee_rates(
-        token_ids,
-        timeout_seconds=config.fee_rate_refresh_timeout_seconds,
-        max_tokens=config.fee_rate_prefetch_max_tokens,
-    )
-    return fee_rate_client.cached_fee_rates(token_ids)
-
-
 def _build_policy_selector(config: Config) -> PolicySelector:
     policy_map = parse_policy_rules(config.policy_rules_json, config.policy_default_id)
     return PolicySelector(policy_map)
@@ -622,41 +606,6 @@ def split_subscribe_groups(
     if current:
         groups.append(current)
     return groups
-
-
-def _build_subscribe_plan(
-    token_ids: list[str],
-    confirm_token_ids: list[str],
-    max_tokens: int,
-    max_bytes: int,
-    variant: str,
-) -> tuple[list[tuple[int, list[str]]], list[tuple[int, list[str]]]]:
-    ordered_tokens = [str(token_id) for token_id in token_ids if str(token_id)]
-    token_set = set(ordered_tokens)
-    confirm_ordered: list[str] = []
-    confirm_seen: set[str] = set()
-    for token_id in confirm_token_ids:
-        token_key = str(token_id)
-        if token_key in token_set and token_key not in confirm_seen:
-            confirm_ordered.append(token_key)
-            confirm_seen.add(token_key)
-    remaining_tokens = [token_id for token_id in ordered_tokens if token_id not in confirm_seen]
-    confirm_groups = (
-        split_subscribe_groups(confirm_ordered, max_tokens, max_bytes, variant)
-        if confirm_ordered
-        else []
-    )
-    remaining_groups = (
-        split_subscribe_groups(remaining_tokens, max_tokens, max_bytes, variant)
-        if remaining_tokens
-        else []
-    )
-    confirm_entries = [(idx, group) for idx, group in enumerate(confirm_groups)]
-    offset = len(confirm_entries)
-    remaining_entries = [
-        (offset + idx, group) for idx, group in enumerate(remaining_groups)
-    ]
-    return confirm_entries, remaining_entries
 
 
 def _sorted_unique_tokens(token_ids: Iterable[str]) -> list[str]:
@@ -1913,28 +1862,12 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         now_ns=now_ns,
                     )
 
-                confirm_groups, remaining_groups = _build_subscribe_plan(
-                    shard.token_ids,
-                    shard.confirm_token_ids,
-                    state.config.ws_subscribe_max_tokens,
-                    state.config.ws_subscribe_max_bytes,
-                    variant,
-                )
-                remaining_sent = not remaining_groups
-
-                async def _send_subscribe_group(
-                    group_index: int,
-                    token_group: list[str],
-                ) -> None:
+                for group_index, token_group in enumerate(shard.groups):
                     payload = build_subscribe_payload(variant, token_group)
                     payload_bytes = orjson.dumps(payload)
                     shard.last_subscribe_variant = variant
                     shard.last_subscribe_group_index = group_index
-                    if state.subscribe_semaphore is None:
-                        await ws.send(payload_bytes.decode("utf-8"))
-                    else:
-                        async with state.subscribe_semaphore:
-                            await ws.send(payload_bytes.decode("utf-8"))
+                    await ws.send(payload_bytes.decode("utf-8"))
                     _write_runlog(
                         run_dir,
                         {
@@ -1947,17 +1880,6 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                             "payload_bytes": len(payload_bytes),
                         },
                     )
-                    pause = state.config.capture_subscribe_group_pause_seconds
-                    if pause > 0:
-                        await asyncio.sleep(pause)
-
-                if confirm_groups:
-                    for group_index, token_group in confirm_groups:
-                        await _send_subscribe_group(group_index, token_group)
-                else:
-                    for group_index, token_group in remaining_groups:
-                        await _send_subscribe_group(group_index, token_group)
-                    remaining_sent = True
 
                 while not state.fatal_event.is_set() and not state.stop_event.is_set():
                     if _refresh_requested(shard):
@@ -1984,10 +1906,6 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         rx_mono_ns=rx_mono_ns,
                         rx_wall_ns_utc=rx_wall_ns_utc,
                     )
-                    if shard.confirmed and not remaining_sent:
-                        for group_index, token_group in remaining_groups:
-                            await _send_subscribe_group(group_index, token_group)
-                        remaining_sent = True
             if refresh_applied:
                 continue
         except Exception as exc:
@@ -2038,9 +1956,7 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
     policy_selector = _build_policy_selector(config)
     fee_regime_monitor = _build_fee_regime_monitor(config)
     fee_results = (
-        await _prefetch_initial_fee_rates(config, fee_rate_client, pinned_tokens)
-        if fee_rate_client
-        else {}
+        fee_rate_client.cached_fee_rates(pinned_tokens) if fee_rate_client else {}
     )
     segment_by_token, segment_by_market = build_segment_maps(
         selected_markets,
@@ -2164,18 +2080,12 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         segment_by_market_id=segment_by_market,
         policy_counts_last=policy_counts_initial,
     )
-    subscribe_semaphore = None
-    if config.capture_subscribe_max_inflight_shards > 0:
-        subscribe_semaphore = asyncio.Semaphore(
-            config.capture_subscribe_max_inflight_shards
-        )
     state = CaptureState(
         run=run,
         config=config,
         shards=shards,
         pinned_tokens=pinned_tokens,
         universe=universe_state,
-        subscribe_semaphore=subscribe_semaphore,
         fee_rate_client=fee_rate_client,
         policy_selector=policy_selector,
         fee_regime_monitor=fee_regime_monitor,

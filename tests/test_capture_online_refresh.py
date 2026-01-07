@@ -16,7 +16,6 @@ from pm_arb.capture_online import (
     _eligible_token_ids,
     _heartbeat_loop,
     _load_startup_universe,
-    _prefetch_initial_fee_rates,
     _refresh_loop,
     _select_changed_shards,
     _should_apply_refresh,
@@ -24,7 +23,6 @@ from pm_arb.capture_online import (
     split_subscribe_groups,
 )
 from pm_arb.config import Config
-from pm_arb.fees import FeeRateResult
 from pm_arb.gamma import UniverseSnapshot
 from pm_arb.segments import build_segment_maps
 
@@ -159,46 +157,6 @@ def test_startup_selection_uses_snapshot(monkeypatch):
     assert [market["id"] for market in pinned_markets] == snapshot.market_ids
     assert [market["id"] for market in selected_markets] == snapshot.market_ids
     assert universe_mode == "active-binary"
-
-
-@pytest.mark.asyncio
-async def test_prefetch_initial_fee_rates_populates_cache():
-    class FakeClient:
-        def __init__(self) -> None:
-            self.prefetch_called = False
-            self._cache: dict[str, FeeRateResult] = {}
-
-        async def prefetch_fee_rates(self, token_ids, timeout_seconds, max_tokens):
-            self.prefetch_called = True
-            for token_id in list(token_ids)[:max_tokens]:
-                result = FeeRateResult(
-                    token_id=str(token_id),
-                    fee_rate_bps=0,
-                    fee_rate_known=True,
-                    fee_enabled=False,
-                    wall_ns_utc=1,
-                    mono_ns=2,
-                    error=None,
-                )
-                self._cache[str(token_id)] = result
-
-        def cached_fee_rates(self, token_ids):
-            return {
-                str(token_id): self._cache[str(token_id)]
-                for token_id in token_ids
-                if str(token_id) in self._cache
-            }
-
-    config = Config(fee_rate_prefetch_max_tokens=2, fee_rate_refresh_timeout_seconds=1.0)
-    client = FakeClient()
-    results = await _prefetch_initial_fee_rates(
-        config,
-        client,
-        ["t1", "t2", "t3"],
-    )
-    assert client.prefetch_called is True
-    assert set(results.keys()) == {"t1", "t2"}
-    assert results["t1"].fee_rate_known is True
 
 
 @pytest.mark.asyncio

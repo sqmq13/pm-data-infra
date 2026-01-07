@@ -3,7 +3,6 @@ from collections import deque
 
 from pm_arb.capture_online import (
     _extract_minimal_fields,
-    _build_subscribe_plan,
     _quantile_from_samples,
     _stable_hash,
     assign_shards_by_token,
@@ -38,24 +37,6 @@ def test_split_subscribe_groups_limits():
         payload_bytes = orjson.dumps(build_subscribe_payload("A", group))
         assert len(payload_bytes) <= 200
     assert split_subscribe_groups(tokens, max_tokens=3, max_bytes=200, variant="A") == groups
-
-
-def test_build_subscribe_plan_confirm_first():
-    tokens = ["t1", "t2", "t3", "t4"]
-    confirm_tokens = ["t3", "t1"]
-    confirm_groups, remaining_groups = _build_subscribe_plan(
-        tokens,
-        confirm_tokens,
-        max_tokens=2,
-        max_bytes=200,
-        variant="A",
-    )
-    assert confirm_groups
-    assert confirm_groups[0][0] == 0
-    assert confirm_groups[0][1] == ["t3", "t1"]
-    remaining_tokens = [token for _, group in remaining_groups for token in group]
-    assert set(remaining_tokens) == {"t2", "t4"}
-    assert not (set(remaining_tokens) & {"t1", "t3"})
 
 
 def test_extract_minimal_fields_book_event():

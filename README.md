@@ -39,16 +39,6 @@ $env:PM_ARB_CAPTURE_UNIVERSE_REFRESH_GRACE_SECONDS = "30"
 pm_arb capture --run-id refresh-<id>
 ```
 
-## Subscription Sizing and Pacing
-
-Large subscribe frames can cause WS confirm timeouts. Defaults are tuned for safety:
-- `PM_ARB_WS_SUBSCRIBE_MAX_BYTES` (default 20000)
-- `PM_ARB_WS_SUBSCRIBE_MAX_TOKENS` (default 200)
-- `PM_ARB_CAPTURE_SUBSCRIBE_GROUP_PAUSE_SECONDS` (default 0.1)
-- `PM_ARB_CAPTURE_SUBSCRIBE_MAX_INFLIGHT_SHARDS` (default 2)
-
-For long runs with refresh enabled, keep payloads well below 32KB and pace group sends.
-
 ## Run Bundle Layout
 
 All files live under `data/runs/<run_id>/`:
