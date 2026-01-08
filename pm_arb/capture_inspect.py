@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -160,3 +161,276 @@ def inspect_run(run_dir: Path) -> InspectSummary:
         },
     }
     return InspectSummary(run_dir, summary)
+
+
+def _quantile_from_sorted(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    rank = max(0, ceil(percentile / 100.0 * len(values)) - 1)
+    return values[rank]
+
+
+def _series_stats(values: list[float]) -> dict[str, float | int]:
+    if not values:
+        return {
+            "count": 0,
+            "min": 0.0,
+            "max": 0.0,
+            "p50": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+        }
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "min": ordered[0],
+        "max": ordered[-1],
+        "p50": _quantile_from_sorted(ordered, 50),
+        "p95": _quantile_from_sorted(ordered, 95),
+        "p99": _quantile_from_sorted(ordered, 99),
+    }
+
+
+def _numeric_series(records: list[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for record in records:
+        value = record.get(key)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return values
+
+
+def _optional_verify_summary(run_dir: Path) -> dict[str, Any]:
+    candidates = (
+        "verify_summary.json",
+        "capture_verify.json",
+        "capture_verify_summary.json",
+    )
+    for name in candidates:
+        path = run_dir / name
+        if path.exists():
+            return {"present": True, "path": str(path), "summary": _load_json(path)}
+    return {"present": False}
+
+
+def _latency_series_summary(records: list[dict[str, Any]], prefix: str) -> dict[str, Any]:
+    return {
+        "p50": _series_stats(_numeric_series(records, f"{prefix}_p50")),
+        "p95": _series_stats(_numeric_series(records, f"{prefix}_p95")),
+        "p99": _series_stats(_numeric_series(records, f"{prefix}_p99")),
+        "max": _series_stats(_numeric_series(records, f"{prefix}_max")),
+        "count": len(_numeric_series(records, f"{prefix}_max")),
+    }
+
+
+def build_latency_report(run_dir: Path) -> dict[str, Any]:
+    run_dir = run_dir.resolve()
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(str(manifest_path))
+    manifest = _load_json(manifest_path)
+    run_id = manifest.get("run_id")
+    metrics_path = run_dir / "metrics" / "global.ndjson"
+    metrics_records = _read_ndjson(metrics_path)
+    runlog_path = run_dir / "runlog.ndjson"
+    runlog_records = _read_ndjson(runlog_path) if runlog_path.exists() else []
+    verify_summary = _optional_verify_summary(run_dir)
+
+    hb_gaps: dict[str, Any] = {}
+    for threshold in (0.5, 1.0, 2.0):
+        key = str(threshold)
+        try:
+            hb_gaps[key] = audit_heartbeat_gaps(
+                run_dir,
+                threshold_seconds=threshold,
+                max_gaps=5,
+            )
+        except FileNotFoundError:
+            hb_gaps[key] = {"error": "runlog_missing"}
+
+    reconnects_total = 0
+    reconnects_by_trigger: dict[str, int] = {}
+    reconnects_by_reason: dict[str, int] = {}
+    for record in runlog_records:
+        if record.get("record_type") != "reconnect":
+            continue
+        reconnects_total += 1
+        trigger = record.get("trigger") or "unknown"
+        reason = record.get("reason") or "unknown"
+        reconnects_by_trigger[trigger] = reconnects_by_trigger.get(trigger, 0) + 1
+        reconnects_by_reason[reason] = reconnects_by_reason.get(reason, 0) + 1
+
+    disconnected_time_total = 0.0
+    disconnected_incidents = 0
+    disconnected_incident_p95 = 0.0
+    disconnected_incident_max = 0.0
+    if metrics_records:
+        last_metrics = metrics_records[-1]
+        if isinstance(last_metrics.get("disconnected_time_s_total"), (int, float)):
+            disconnected_time_total = float(last_metrics["disconnected_time_s_total"])
+        if isinstance(last_metrics.get("disconnected_incidents"), int):
+            disconnected_incidents = int(last_metrics["disconnected_incidents"])
+        if isinstance(
+            last_metrics.get("disconnected_incident_duration_s_p95"), (int, float)
+        ):
+            disconnected_incident_p95 = float(
+                last_metrics["disconnected_incident_duration_s_p95"]
+            )
+        if isinstance(
+            last_metrics.get("disconnected_incident_duration_s_max"), (int, float)
+        ):
+            disconnected_incident_max = float(
+                last_metrics["disconnected_incident_duration_s_max"]
+            )
+
+    rx_idle_stats = _series_stats(_numeric_series(metrics_records, "rx_idle_s_max"))
+    loop_lag_stats = _series_stats(
+        _numeric_series(metrics_records, "loop_lag_ms_max_last_interval")
+    )
+    dropped_count_stats = _series_stats(
+        _numeric_series(metrics_records, "dropped_messages_count")
+    )
+    dropped_total = 0
+    if metrics_records:
+        last_metrics = metrics_records[-1]
+        if isinstance(last_metrics.get("dropped_messages_total"), int):
+            dropped_total = int(last_metrics["dropped_messages_total"])
+
+    ws_in_q_stats = {
+        "p95": _series_stats(_numeric_series(metrics_records, "ws_in_q_depth_p95")),
+        "max": _series_stats(_numeric_series(metrics_records, "ws_in_q_depth_max")),
+    }
+    parse_q_stats = {
+        "p95": _series_stats(_numeric_series(metrics_records, "parse_q_depth_p95")),
+        "max": _series_stats(_numeric_series(metrics_records, "parse_q_depth_max")),
+    }
+    write_q_stats = {
+        "p95": _series_stats(_numeric_series(metrics_records, "write_q_depth_p95")),
+        "max": _series_stats(_numeric_series(metrics_records, "write_q_depth_max")),
+    }
+
+    refresh_durations = _numeric_series(metrics_records, "universe_refresh_duration_ms")
+    refresh_durations = [value for value in refresh_durations if value > 0]
+    refresh_duration_stats = _series_stats(refresh_durations)
+    refresh_failures = 0
+    if metrics_records:
+        last_metrics = metrics_records[-1]
+        if isinstance(last_metrics.get("refresh_failures"), int):
+            refresh_failures = int(last_metrics["refresh_failures"])
+    refresh_errors = sum(
+        1 for record in runlog_records if record.get("record_type") == "universe_refresh_error"
+    )
+
+    report = {
+        "run_dir": str(run_dir),
+        "run_id": run_id,
+        "capture_verify": verify_summary,
+        "hb_gaps": hb_gaps,
+        "reconnects": {
+            "total": reconnects_total,
+            "by_trigger": dict(sorted(reconnects_by_trigger.items())),
+            "by_reason": dict(sorted(reconnects_by_reason.items())),
+        },
+        "disconnected": {
+            "time_s_total": disconnected_time_total,
+            "incidents": disconnected_incidents,
+            "incident_duration_s_p95": disconnected_incident_p95,
+            "incident_duration_s_max": disconnected_incident_max,
+        },
+        "rx_idle": rx_idle_stats,
+        "ingest_latency_ms": {
+            "ws_rx_to_enqueue_ms": _latency_series_summary(
+                metrics_records, "ws_rx_to_enqueue_ms"
+            ),
+            "ws_rx_to_parsed_ms": _latency_series_summary(
+                metrics_records, "ws_rx_to_parsed_ms"
+            ),
+            "ws_rx_to_applied_ms": _latency_series_summary(
+                metrics_records, "ws_rx_to_applied_ms"
+            ),
+        },
+        "queue_depth": {
+            "ws_in_q_depth": ws_in_q_stats,
+            "parse_q_depth": parse_q_stats,
+            "write_q_depth": write_q_stats,
+        },
+        "drops": {
+            "dropped_messages_total": dropped_total,
+            "dropped_messages_per_interval": dropped_count_stats,
+        },
+        "loop_lag_ms": loop_lag_stats,
+        "refresh": {
+            "duration_ms": refresh_duration_stats,
+            "failures": refresh_failures,
+            "errors": refresh_errors,
+        },
+    }
+    return report
+
+
+def _latency_report_text(report: dict[str, Any]) -> str:
+    lines = [
+        f"run_id: {report.get('run_id')}",
+        f"run_dir: {report.get('run_dir')}",
+    ]
+    verify = report.get("capture_verify") or {}
+    if verify.get("present"):
+        lines.append(f"capture_verify: present ({verify.get('path')})")
+    else:
+        lines.append("capture_verify: missing")
+    hb_gaps = report.get("hb_gaps") or {}
+    for threshold in ("0.5", "1.0", "2.0"):
+        summary = hb_gaps.get(threshold, {})
+        if "error" in summary:
+            lines.append(f"hb_gaps>{threshold}s: error={summary.get('error')}")
+            continue
+        lines.append(
+            f"hb_gaps>{threshold}s: count={summary.get('gaps_over_threshold', 0)} "
+            f"max={summary.get('max_gap_seconds', 0.0)}"
+        )
+    reconnects = report.get("reconnects") or {}
+    lines.append(f"reconnects_total: {reconnects.get('total', 0)}")
+    disconnected = report.get("disconnected") or {}
+    lines.append(
+        "disconnected: time_s_total={:.3f} incidents={} "
+        "duration_s_p95={:.3f} duration_s_max={:.3f}".format(
+            float(disconnected.get("time_s_total", 0.0)),
+            int(disconnected.get("incidents", 0)),
+            float(disconnected.get("incident_duration_s_p95", 0.0)),
+            float(disconnected.get("incident_duration_s_max", 0.0)),
+        )
+    )
+    rx_idle = report.get("rx_idle") or {}
+    lines.append(
+        "rx_idle_s_max: p95={:.3f} max={:.3f}".format(
+            float(rx_idle.get("p95", 0.0)),
+            float(rx_idle.get("max", 0.0)),
+        )
+    )
+    loop_lag = report.get("loop_lag_ms") or {}
+    lines.append(
+        "loop_lag_ms: p95={:.3f} max={:.3f}".format(
+            float(loop_lag.get("p95", 0.0)),
+            float(loop_lag.get("max", 0.0)),
+        )
+    )
+    refresh = report.get("refresh") or {}
+    refresh_duration = refresh.get("duration_ms") or {}
+    lines.append(
+        "refresh_duration_ms: p95={:.3f} max={:.3f} errors={}".format(
+            float(refresh_duration.get("p95", 0.0)),
+            float(refresh_duration.get("max", 0.0)),
+            int(refresh.get("errors", 0)),
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
+def write_latency_report(run_dir: Path) -> dict[str, Any]:
+    report = build_latency_report(run_dir)
+    json_payload = json.dumps(report, ensure_ascii=True, separators=(",", ":"))
+    (run_dir / "latency_report.json").write_text(json_payload + "\n", encoding="utf-8")
+    (run_dir / "latency_report.txt").write_text(
+        _latency_report_text(report), encoding="utf-8"
+    )
+    return report

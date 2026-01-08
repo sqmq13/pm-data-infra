@@ -133,6 +133,12 @@ class _ParseWorker:
             "processed": self._processed,
         }
 
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    def results_size(self) -> int:
+        return self._results.qsize()
+
     def _run(self) -> None:
         while True:
             job = self._queue.get()
@@ -180,6 +186,7 @@ class _FrameWriteResult:
     header_bytes: bytes
     schema_version: int
     payload_len: int
+    rx_mono_ns: int
     write_duration_ns: int
     ingest_latency_ns: int
     backpressure_ns: int
@@ -243,6 +250,12 @@ class _FrameWriter:
             "processed": self._processed,
         }
 
+    def queue_size(self) -> int:
+        return self._queue.qsize()
+
+    def results_size(self) -> int:
+        return self._results.qsize()
+
     def _run(self) -> None:
         while True:
             job = self._queue.get()
@@ -294,6 +307,7 @@ class _FrameWriter:
                 header_bytes=header_bytes,
                 schema_version=record.schema_version,
                 payload_len=record.payload_len,
+                rx_mono_ns=record.rx_mono_ns,
                 write_duration_ns=write_end_ns - write_start_ns,
                 ingest_latency_ns=ingest_latency_ns,
                 backpressure_ns=backpressure_ns,
@@ -520,6 +534,11 @@ class ShardState:
     subscribe_variant_locked: str | None = None
     subscribe_variant_index: int = 0
     last_yield_mono_ns: int = 0
+    connected: bool = False
+    last_rx_mono_ns: int = 0
+    disconnected_since_mono_ns: int | None = None
+    disconnected_time_s_total: float = 0.0
+    disconnected_incidents: int = 0
 
 
 @dataclass
@@ -600,6 +619,16 @@ class CaptureState:
     frame_writer: _FrameWriter | None = None
     frame_write_dropped_total: int = 0
     loop_lag_samples_ms: deque[float] = field(default_factory=lambda: deque(maxlen=1000))
+    ws_rx_to_enqueue_ms_samples: deque[int] = field(default_factory=deque)
+    ws_rx_to_parsed_ms_samples: deque[int] = field(default_factory=deque)
+    ws_rx_to_applied_ms_samples: deque[int] = field(default_factory=deque)
+    ws_in_q_depth_samples: deque[int] = field(default_factory=deque)
+    parse_q_depth_samples: deque[int] = field(default_factory=deque)
+    write_q_depth_samples: deque[int] = field(default_factory=deque)
+    dropped_messages_total_last: int = 0
+    disconnected_time_s_total: float = 0.0
+    disconnected_incidents: int = 0
+    disconnected_incident_durations_s: deque[float] = field(default_factory=deque)
     stop_event: asyncio.Event = field(default_factory=asyncio.Event)
     stop_reason: str | None = None
     gc_was_enabled: bool = False
@@ -638,6 +667,34 @@ def _quantiles_from_samples(
         rank = max(0, ceil(percentile / 100.0 * count) - 1)
         result[percentile] = ordered[rank]
     return result
+
+
+def _quantiles_from_samples_any(
+    samples: Iterable[int],
+    percentiles: Iterable[float],
+) -> dict[float, int]:
+    values = list(samples)
+    result: dict[float, int] = {}
+    if not values:
+        for percentile in percentiles:
+            result[percentile] = 0
+        return result
+    ordered = sorted(values)
+    count = len(ordered)
+    for percentile in percentiles:
+        rank = max(0, ceil(percentile / 100.0 * count) - 1)
+        result[percentile] = ordered[rank]
+    return result
+
+
+def _quantile_from_float_samples(samples: Iterable[float], percentile: float) -> float:
+    values = [value for value in samples if value >= 0]
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    count = len(ordered)
+    rank = max(0, ceil(percentile / 100.0 * count) - 1)
+    return ordered[rank]
 
 
 def _mark_reconnecting(shard: ShardState) -> None:
@@ -1774,6 +1831,14 @@ async def _parse_results_loop(state: CaptureState) -> None:
             if result is None:
                 break
             processed += 1
+            parsed_latency_ms = int(
+                max(0, (monotonic_ns() - result.rx_mono_ns) / 1_000_000)
+            )
+            _append_sample(
+                state.ws_rx_to_parsed_ms_samples,
+                parsed_latency_ms,
+                state.config.capture_metrics_max_samples,
+            )
             shard = state.shards[result.shard_id]
             if result.decode_error:
                 shard.stats.decode_errors += 1
@@ -1800,6 +1865,14 @@ async def _write_results_loop(state: CaptureState) -> None:
             if result is None:
                 break
             processed += 1
+            applied_latency_ms = int(
+                max(0, (monotonic_ns() - result.rx_mono_ns) / 1_000_000)
+            )
+            _append_sample(
+                state.ws_rx_to_applied_ms_samples,
+                applied_latency_ms,
+                state.config.capture_metrics_max_samples,
+            )
             shard = state.shards[result.shard_id]
             shard.stats.record(
                 result.payload_len,
@@ -1813,6 +1886,11 @@ async def _write_results_loop(state: CaptureState) -> None:
                 state.config.capture_metrics_max_samples,
             )
             shard.ring.append((result.header_bytes, result.payload_bytes))
+            _append_sample(
+                state.write_q_depth_samples,
+                writer.results_size(),
+                state.config.capture_metrics_max_samples,
+            )
         if processed == 0:
             await asyncio.sleep(sleep_seconds)
 
@@ -1844,6 +1922,34 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 "hb_wall_ns_utc": hb_wall_ns_utc,
                 "hb_mono_ns": now_ns,
             },
+        )
+
+        rx_idle_s_max = 0.0
+        disconnected_time_s_total = state.disconnected_time_s_total
+        disconnected_incidents = state.disconnected_incidents
+        disconnected_active = 0
+        incident_durations: list[float] = list(state.disconnected_incident_durations_s)
+        for shard in state.shards:
+            if shard.connected and shard.last_rx_mono_ns:
+                idle_s = (now_ns - shard.last_rx_mono_ns) / 1_000_000_000.0
+                if idle_s > rx_idle_s_max:
+                    rx_idle_s_max = idle_s
+            if shard.disconnected_since_mono_ns is not None:
+                disconnected_active += 1
+                duration_s = (
+                    now_ns - shard.disconnected_since_mono_ns
+                ) / 1_000_000_000.0
+                disconnected_time_s_total += duration_s
+                incident_durations.append(duration_s)
+        disconnected_incidents_total = disconnected_incidents + disconnected_active
+        disconnected_incident_duration_s_p50 = _quantile_from_float_samples(
+            incident_durations, 50
+        )
+        disconnected_incident_duration_s_p95 = _quantile_from_float_samples(
+            incident_durations, 95
+        )
+        disconnected_incident_duration_s_max = (
+            max(incident_durations) if incident_durations else 0.0
         )
 
         global_frames = 0
@@ -1959,11 +2065,51 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         frame_write_stats = (
             state.frame_writer.stats() if state.frame_writer is not None else {}
         )
+        enqueue_samples = list(state.ws_rx_to_enqueue_ms_samples)
+        parsed_samples = list(state.ws_rx_to_parsed_ms_samples)
+        applied_samples = list(state.ws_rx_to_applied_ms_samples)
+        ws_in_q_samples = list(state.ws_in_q_depth_samples)
+        parse_q_samples = list(state.parse_q_depth_samples)
+        write_q_samples = list(state.write_q_depth_samples)
+        enqueue_quantiles = _quantiles_from_samples(enqueue_samples, (50, 95, 99))
+        parsed_quantiles = _quantiles_from_samples(parsed_samples, (50, 95, 99))
+        applied_quantiles = _quantiles_from_samples(applied_samples, (50, 95, 99))
+        ws_in_q_quantiles = _quantiles_from_samples_any(ws_in_q_samples, (95,))
+        parse_q_quantiles = _quantiles_from_samples_any(parse_q_samples, (95,))
+        write_q_quantiles = _quantiles_from_samples_any(write_q_samples, (95,))
+        enqueue_max = max(enqueue_samples) if enqueue_samples else 0
+        parsed_max = max(parsed_samples) if parsed_samples else 0
+        applied_max = max(applied_samples) if applied_samples else 0
+        ws_in_q_max = max(ws_in_q_samples) if ws_in_q_samples else 0
+        parse_q_max = max(parse_q_samples) if parse_q_samples else 0
+        write_q_max = max(write_q_samples) if write_q_samples else 0
         loop_lag_samples = list(state.loop_lag_samples_ms)
         loop_lag_ms_max_last_interval = (
             max(loop_lag_samples) if loop_lag_samples else 0.0
         )
         state.loop_lag_samples_ms.clear()
+        state.ws_rx_to_enqueue_ms_samples.clear()
+        state.ws_rx_to_parsed_ms_samples.clear()
+        state.ws_rx_to_applied_ms_samples.clear()
+        state.ws_in_q_depth_samples.clear()
+        state.parse_q_depth_samples.clear()
+        state.write_q_depth_samples.clear()
+        parse_dropped = parse_stats.get("dropped", state.parse_dropped_total)
+        parse_results_dropped = parse_stats.get("results_dropped", 0)
+        frame_write_dropped = frame_write_stats.get(
+            "dropped", state.frame_write_dropped_total
+        )
+        frame_write_results_dropped = frame_write_stats.get("results_dropped", 0)
+        dropped_messages_total = (
+            parse_dropped
+            + parse_results_dropped
+            + frame_write_dropped
+            + frame_write_results_dropped
+        )
+        dropped_messages_count = max(
+            0, dropped_messages_total - state.dropped_messages_total_last
+        )
+        state.dropped_messages_total_last = dropped_messages_total
         global_write_quantiles = _quantiles_from_samples(global_write_samples, (50, 95, 99))
         global_ingest_quantiles = _quantiles_from_samples(
             global_ingest_samples, (50, 95, 99)
@@ -2020,6 +2166,35 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "rollover_window_hit": state.universe.expected_churn_rollover_hit_last,
             "expiry_window_hit": state.universe.expected_churn_expiry_hit_last,
             "loop_lag_ms_max_last_interval": loop_lag_ms_max_last_interval,
+            "ws_rx_to_enqueue_ms_p50": enqueue_quantiles[50],
+            "ws_rx_to_enqueue_ms_p95": enqueue_quantiles[95],
+            "ws_rx_to_enqueue_ms_p99": enqueue_quantiles[99],
+            "ws_rx_to_enqueue_ms_max": enqueue_max,
+            "ws_rx_to_enqueue_ms_count": len(enqueue_samples),
+            "ws_rx_to_parsed_ms_p50": parsed_quantiles[50],
+            "ws_rx_to_parsed_ms_p95": parsed_quantiles[95],
+            "ws_rx_to_parsed_ms_p99": parsed_quantiles[99],
+            "ws_rx_to_parsed_ms_max": parsed_max,
+            "ws_rx_to_parsed_ms_count": len(parsed_samples),
+            "ws_rx_to_applied_ms_p50": applied_quantiles[50],
+            "ws_rx_to_applied_ms_p95": applied_quantiles[95],
+            "ws_rx_to_applied_ms_p99": applied_quantiles[99],
+            "ws_rx_to_applied_ms_max": applied_max,
+            "ws_rx_to_applied_ms_count": len(applied_samples),
+            "ws_in_q_depth_p95": ws_in_q_quantiles[95],
+            "ws_in_q_depth_max": ws_in_q_max,
+            "parse_q_depth_p95": parse_q_quantiles[95],
+            "parse_q_depth_max": parse_q_max,
+            "write_q_depth_p95": write_q_quantiles[95],
+            "write_q_depth_max": write_q_max,
+            "dropped_messages_count": dropped_messages_count,
+            "dropped_messages_total": dropped_messages_total,
+            "rx_idle_s_max": rx_idle_s_max,
+            "disconnected_time_s_total": disconnected_time_s_total,
+            "disconnected_incidents": disconnected_incidents_total,
+            "disconnected_incident_duration_s_p50": disconnected_incident_duration_s_p50,
+            "disconnected_incident_duration_s_p95": disconnected_incident_duration_s_p95,
+            "disconnected_incident_duration_s_max": disconnected_incident_duration_s_max,
             "fee_rate_cache_hits": fee_rate_stats.get("cache_hits", 0),
             "fee_rate_cache_misses": fee_rate_stats.get("cache_misses", 0),
             "fee_rate_unknown_count": state.universe.fee_rate_unknown_count_last,
@@ -2074,6 +2249,12 @@ def _handle_payload(
     rx_wall_ns_utc: int,
 ) -> None:
     payload_bytes, flags = _payload_bytes(raw)
+    enqueue_latency_ms = int(max(0, (monotonic_ns() - rx_mono_ns) / 1_000_000))
+    _append_sample(
+        state.ws_rx_to_enqueue_ms_samples,
+        enqueue_latency_ms,
+        state.config.capture_metrics_max_samples,
+    )
     confirm_event = _fast_confirm_event(payload_bytes)
     if confirm_event:
         shard.confirm_events_seen += 1
@@ -2126,6 +2307,11 @@ def _handle_payload(
                     )
                 )
             return
+        _append_sample(
+            state.ws_in_q_depth_samples,
+            state.frame_writer.queue_size(),
+            state.config.capture_metrics_max_samples,
+        )
     else:
         write_start_ns = monotonic_ns()
         record = append_record(
@@ -2198,6 +2384,12 @@ def _handle_payload(
         )
     ):
         state.parse_dropped_total += 1
+    else:
+        _append_sample(
+            state.parse_q_depth_samples,
+            state.parse_worker.queue_size(),
+            state.config.capture_metrics_max_samples,
+        )
 
 
 def _refresh_requested(shard: ShardState) -> bool:
@@ -2771,6 +2963,19 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                 state.config.clob_ws_url,
                 **connect_kwargs,
             ) as ws:
+                connected_ns = monotonic_ns()
+                if shard.disconnected_since_mono_ns is not None:
+                    duration_s = (
+                        connected_ns - shard.disconnected_since_mono_ns
+                    ) / 1_000_000_000.0
+                    shard.disconnected_time_s_total += duration_s
+                    shard.disconnected_incidents += 1
+                    state.disconnected_time_s_total += duration_s
+                    state.disconnected_incidents += 1
+                    state.disconnected_incident_durations_s.append(duration_s)
+                    shard.disconnected_since_mono_ns = None
+                shard.connected = True
+                shard.last_rx_mono_ns = connected_ns
                 _mark_reconnecting(shard)
                 _write_runlog(
                     run_dir,
@@ -2783,6 +2988,8 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         "ping_interval_seconds": ping_interval,
                         "ping_timeout_seconds": ping_timeout,
                         "data_idle_reconnect_seconds": data_idle_reconnect_seconds,
+                        "ts_mono_ns": connected_ns,
+                        "ts_wall_ns_utc": time.time_ns(),
                     },
                 )
                 shard.last_subscribe_variant = variant
@@ -2862,6 +3069,7 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
 
                     rx_mono_ns = monotonic_ns()
                     last_rx_mono_ns = rx_mono_ns
+                    shard.last_rx_mono_ns = rx_mono_ns
                     rx_wall_ns_utc = time.time_ns()
                     await _check_confirm_deadline(monotonic_ns())
                     _handle_payload(
@@ -2879,6 +3087,10 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
         except Exception as exc:
             if state.stop_event.is_set():
                 break
+            now_ns = monotonic_ns()
+            if shard.connected:
+                shard.connected = False
+                shard.disconnected_since_mono_ns = now_ns
             _mark_reconnecting(shard)
             shard.reconnects += 1
             trigger = _classify_reconnect_trigger(exc)
@@ -2898,6 +3110,8 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                     "ping_timeout_seconds": ping_timeout,
                     "data_idle_reconnect_seconds": data_idle_reconnect_seconds,
                     "reconnects": shard.reconnects,
+                    "ts_mono_ns": now_ns,
+                    "ts_wall_ns_utc": time.time_ns(),
                 },
             )
             if shard.reconnects >= state.config.ws_reconnect_max:
@@ -3049,6 +3263,7 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
                 ring=ring,
                 confirm_token_ids=target.confirm_token_ids,
                 target=target,
+                disconnected_since_mono_ns=run.t0_mono_ns,
             )
         )
     token_added_mono_ns: dict[str, int] = {}
