@@ -232,21 +232,34 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
     run_id = manifest.get("run_id")
     metrics_path = run_dir / "metrics" / "global.ndjson"
     metrics_records = _read_ndjson(metrics_path)
+    metrics_dir = run_dir / "metrics"
+    shard_metrics_records: dict[str, list[dict[str, Any]]] = {}
+    for metrics_path in sorted(metrics_dir.glob("shard_*.ndjson")):
+        shard_metrics_records[metrics_path.stem] = _read_ndjson(metrics_path)
     runlog_path = run_dir / "runlog.ndjson"
     runlog_records = _read_ndjson(runlog_path) if runlog_path.exists() else []
     verify_summary = _optional_verify_summary(run_dir)
 
-    hb_gaps: dict[str, Any] = {}
-    for threshold in (0.5, 1.0, 2.0):
-        key = str(threshold)
-        try:
-            hb_gaps[key] = audit_heartbeat_gaps(
-                run_dir,
-                threshold_seconds=threshold,
-                max_gaps=5,
-            )
-        except FileNotFoundError:
-            hb_gaps[key] = {"error": "runlog_missing"}
+    config = manifest.get("config") or {}
+    expected_hb_interval_s = float(
+        config.get("capture_heartbeat_interval_seconds", 1.0)
+    )
+    hb_mono_ns: list[int] = []
+    for record in runlog_records:
+        if record.get("record_type") != "heartbeat":
+            continue
+        hb_mono = record.get("hb_mono_ns")
+        if isinstance(hb_mono, int):
+            hb_mono_ns.append(hb_mono)
+    hb_dt_s: list[float] = []
+    for prev, curr in zip(hb_mono_ns, hb_mono_ns[1:]):
+        hb_dt_s.append((curr - prev) / 1_000_000_000.0)
+    hb_jitter_s = [dt - expected_hb_interval_s for dt in hb_dt_s]
+    hb_counts_over = {
+        "1.25": sum(1 for dt in hb_dt_s if dt > 1.25),
+        "1.5": sum(1 for dt in hb_dt_s if dt > 1.5),
+        "2.0": sum(1 for dt in hb_dt_s if dt > 2.0),
+    }
 
     reconnects_total = 0
     reconnects_by_trigger: dict[str, int] = {}
@@ -260,30 +273,60 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
         reconnects_by_trigger[trigger] = reconnects_by_trigger.get(trigger, 0) + 1
         reconnects_by_reason[reason] = reconnects_by_reason.get(reason, 0) + 1
 
-    disconnected_time_total = 0.0
-    disconnected_incidents = 0
-    disconnected_incident_p95 = 0.0
-    disconnected_incident_max = 0.0
+    startup_connect_values: list[float] = []
+    midrun_disconnected_total = 0.0
+    midrun_disconnected_incidents = 0
+    midrun_disconnected_incident_p95 = 0.0
+    midrun_disconnected_incident_max = 0.0
+    startup_connect_pending_shards = 0
     if metrics_records:
         last_metrics = metrics_records[-1]
-        if isinstance(last_metrics.get("disconnected_time_s_total"), (int, float)):
-            disconnected_time_total = float(last_metrics["disconnected_time_s_total"])
-        if isinstance(last_metrics.get("disconnected_incidents"), int):
-            disconnected_incidents = int(last_metrics["disconnected_incidents"])
-        if isinstance(
-            last_metrics.get("disconnected_incident_duration_s_p95"), (int, float)
-        ):
-            disconnected_incident_p95 = float(
-                last_metrics["disconnected_incident_duration_s_p95"]
+        if isinstance(last_metrics.get("midrun_disconnected_time_s_total"), (int, float)):
+            midrun_disconnected_total = float(
+                last_metrics["midrun_disconnected_time_s_total"]
+            )
+        if isinstance(last_metrics.get("midrun_disconnected_incidents"), int):
+            midrun_disconnected_incidents = int(
+                last_metrics["midrun_disconnected_incidents"]
             )
         if isinstance(
-            last_metrics.get("disconnected_incident_duration_s_max"), (int, float)
+            last_metrics.get("midrun_disconnected_incident_duration_s_p95"),
+            (int, float),
         ):
-            disconnected_incident_max = float(
-                last_metrics["disconnected_incident_duration_s_max"]
+            midrun_disconnected_incident_p95 = float(
+                last_metrics["midrun_disconnected_incident_duration_s_p95"]
+            )
+        if isinstance(
+            last_metrics.get("midrun_disconnected_incident_duration_s_max"),
+            (int, float),
+        ):
+            midrun_disconnected_incident_max = float(
+                last_metrics["midrun_disconnected_incident_duration_s_max"]
+            )
+        if isinstance(last_metrics.get("startup_connect_pending_shards"), int):
+            startup_connect_pending_shards = int(
+                last_metrics["startup_connect_pending_shards"]
             )
 
-    rx_idle_stats = _series_stats(_numeric_series(metrics_records, "rx_idle_s_max"))
+    for shard_id, records in shard_metrics_records.items():
+        if not records:
+            continue
+        last_record = records[-1]
+        value = last_record.get("startup_connect_time_s")
+        if isinstance(value, (int, float)):
+            startup_connect_values.append(float(value))
+    startup_connect_stats = _series_stats(startup_connect_values)
+
+    rx_idle_any_stats = _series_stats(
+        _numeric_series(metrics_records, "rx_idle_any_shard_s")
+    )
+    rx_idle_all_stats = _series_stats(
+        _numeric_series(metrics_records, "rx_idle_all_shards_s")
+    )
+    rx_idle_per_shard: dict[str, Any] = {}
+    for shard_id, records in shard_metrics_records.items():
+        rx_values = _numeric_series(records, "rx_idle_s")
+        rx_idle_per_shard[shard_id] = _series_stats(rx_values)
     loop_lag_stats = _series_stats(
         _numeric_series(metrics_records, "loop_lag_ms_max_last_interval")
     )
@@ -309,35 +352,69 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
         "max": _series_stats(_numeric_series(metrics_records, "write_q_depth_max")),
     }
 
-    refresh_durations = _numeric_series(metrics_records, "universe_refresh_duration_ms")
-    refresh_durations = [value for value in refresh_durations if value > 0]
+    refresh_records = [
+        record
+        for record in runlog_records
+        if record.get("record_type") in {"universe_refresh", "universe_refresh_error"}
+    ]
+    refresh_durations = [
+        float(record.get("duration_ms"))
+        for record in refresh_records
+        if isinstance(record.get("duration_ms"), (int, float))
+    ]
     refresh_duration_stats = _series_stats(refresh_durations)
-    refresh_failures = 0
-    if metrics_records:
-        last_metrics = metrics_records[-1]
-        if isinstance(last_metrics.get("refresh_failures"), int):
-            refresh_failures = int(last_metrics["refresh_failures"])
     refresh_errors = sum(
-        1 for record in runlog_records if record.get("record_type") == "universe_refresh_error"
+        1
+        for record in refresh_records
+        if record.get("record_type") == "universe_refresh_error"
     )
 
     report = {
         "run_dir": str(run_dir),
         "run_id": run_id,
         "capture_verify": verify_summary,
-        "hb_gaps": hb_gaps,
+        "heartbeat": {
+            "expected_interval_s": expected_hb_interval_s,
+            "dt_s": _series_stats(hb_dt_s),
+            "jitter_s": _series_stats(hb_jitter_s),
+            "counts_over_s": hb_counts_over,
+        },
         "reconnects": {
             "total": reconnects_total,
             "by_trigger": dict(sorted(reconnects_by_trigger.items())),
             "by_reason": dict(sorted(reconnects_by_reason.items())),
         },
         "disconnected": {
-            "time_s_total": disconnected_time_total,
-            "incidents": disconnected_incidents,
-            "incident_duration_s_p95": disconnected_incident_p95,
-            "incident_duration_s_max": disconnected_incident_max,
+            "startup_connect_time_s": {
+                "stats": startup_connect_stats,
+                "pending_shards": startup_connect_pending_shards,
+                "by_shard": {
+                    shard_id: shard_metrics_records[shard_id][-1].get(
+                        "startup_connect_time_s"
+                    )
+                    for shard_id in shard_metrics_records
+                    if shard_metrics_records[shard_id]
+                },
+            },
+            "midrun": {
+                "time_s_total": midrun_disconnected_total,
+                "incidents": midrun_disconnected_incidents,
+                "incident_duration_s_p95": midrun_disconnected_incident_p95,
+                "incident_duration_s_max": midrun_disconnected_incident_max,
+                "by_shard": {
+                    shard_id: shard_metrics_records[shard_id][-1].get(
+                        "midrun_disconnected_time_s_total"
+                    )
+                    for shard_id in shard_metrics_records
+                    if shard_metrics_records[shard_id]
+                },
+            },
         },
-        "rx_idle": rx_idle_stats,
+        "rx_idle": {
+            "global_any_shard_s": rx_idle_any_stats,
+            "global_all_shards_s": rx_idle_all_stats,
+            "per_shard": rx_idle_per_shard,
+        },
         "ingest_latency_ms": {
             "ws_rx_to_enqueue_ms": _latency_series_summary(
                 metrics_records, "ws_rx_to_enqueue_ms"
@@ -361,7 +438,7 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
         "loop_lag_ms": loop_lag_stats,
         "refresh": {
             "duration_ms": refresh_duration_stats,
-            "failures": refresh_failures,
+            "count": len(refresh_records),
             "errors": refresh_errors,
         },
     }
@@ -378,33 +455,58 @@ def _latency_report_text(report: dict[str, Any]) -> str:
         lines.append(f"capture_verify: present ({verify.get('path')})")
     else:
         lines.append("capture_verify: missing")
-    hb_gaps = report.get("hb_gaps") or {}
-    for threshold in ("0.5", "1.0", "2.0"):
-        summary = hb_gaps.get(threshold, {})
-        if "error" in summary:
-            lines.append(f"hb_gaps>{threshold}s: error={summary.get('error')}")
-            continue
-        lines.append(
-            f"hb_gaps>{threshold}s: count={summary.get('gaps_over_threshold', 0)} "
-            f"max={summary.get('max_gap_seconds', 0.0)}"
+    heartbeat = report.get("heartbeat") or {}
+    dt_stats = heartbeat.get("dt_s") or {}
+    jitter_stats = heartbeat.get("jitter_s") or {}
+    counts_over = heartbeat.get("counts_over_s") or {}
+    lines.append(
+        "hb_dt_s: p95={:.3f} max={:.3f} count_over_1.25s={} count_over_1.5s={} count_over_2.0s={}".format(
+            float(dt_stats.get("p95", 0.0)),
+            float(dt_stats.get("max", 0.0)),
+            int(counts_over.get("1.25", 0)),
+            int(counts_over.get("1.5", 0)),
+            int(counts_over.get("2.0", 0)),
         )
+    )
+    lines.append(
+        "hb_jitter_s: p95={:.3f} max={:.3f}".format(
+            float(jitter_stats.get("p95", 0.0)),
+            float(jitter_stats.get("max", 0.0)),
+        )
+    )
     reconnects = report.get("reconnects") or {}
     lines.append(f"reconnects_total: {reconnects.get('total', 0)}")
     disconnected = report.get("disconnected") or {}
+    startup = disconnected.get("startup_connect_time_s") or {}
+    startup_stats = startup.get("stats") or {}
     lines.append(
-        "disconnected: time_s_total={:.3f} incidents={} "
+        "startup_connect_time_s: p95={:.3f} max={:.3f} pending_shards={}".format(
+            float(startup_stats.get("p95", 0.0)),
+            float(startup_stats.get("max", 0.0)),
+            int(startup.get("pending_shards", 0)),
+        )
+    )
+    midrun = disconnected.get("midrun") or {}
+    lines.append(
+        "midrun_disconnected: time_s_total={:.3f} incidents={} "
         "duration_s_p95={:.3f} duration_s_max={:.3f}".format(
-            float(disconnected.get("time_s_total", 0.0)),
-            int(disconnected.get("incidents", 0)),
-            float(disconnected.get("incident_duration_s_p95", 0.0)),
-            float(disconnected.get("incident_duration_s_max", 0.0)),
+            float(midrun.get("time_s_total", 0.0)),
+            int(midrun.get("incidents", 0)),
+            float(midrun.get("incident_duration_s_p95", 0.0)),
+            float(midrun.get("incident_duration_s_max", 0.0)),
         )
     )
     rx_idle = report.get("rx_idle") or {}
     lines.append(
-        "rx_idle_s_max: p95={:.3f} max={:.3f}".format(
-            float(rx_idle.get("p95", 0.0)),
-            float(rx_idle.get("max", 0.0)),
+        "rx_idle_any_shard_s: p95={:.3f} max={:.3f}".format(
+            float((rx_idle.get("global_any_shard_s") or {}).get("p95", 0.0)),
+            float((rx_idle.get("global_any_shard_s") or {}).get("max", 0.0)),
+        )
+    )
+    lines.append(
+        "rx_idle_all_shards_s: p95={:.3f} max={:.3f}".format(
+            float((rx_idle.get("global_all_shards_s") or {}).get("p95", 0.0)),
+            float((rx_idle.get("global_all_shards_s") or {}).get("max", 0.0)),
         )
     )
     loop_lag = report.get("loop_lag_ms") or {}
@@ -417,9 +519,10 @@ def _latency_report_text(report: dict[str, Any]) -> str:
     refresh = report.get("refresh") or {}
     refresh_duration = refresh.get("duration_ms") or {}
     lines.append(
-        "refresh_duration_ms: p95={:.3f} max={:.3f} errors={}".format(
+        "refresh_duration_ms: p95={:.3f} max={:.3f} count={} errors={}".format(
             float(refresh_duration.get("p95", 0.0)),
             float(refresh_duration.get("max", 0.0)),
+            int(refresh.get("count", 0)),
             int(refresh.get("errors", 0)),
         )
     )

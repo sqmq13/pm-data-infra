@@ -32,13 +32,10 @@ Out of scope:
 
 ## Workflow
 
-Before editing, include:
-- FILES TO EDIT
+After editing, include:
 - PLAN
 - BEHAVIOR CHANGES
 - ROLLBACK PLAN
-
-After editing, include:
 - Commands run for verification and pass/fail results.
 - Any new tests added and what they assert.
 
