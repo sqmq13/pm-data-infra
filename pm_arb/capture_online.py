@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import os
 import platform
 import shutil
@@ -10,6 +11,7 @@ import signal
 import socket
 import struct
 import time
+import warnings
 from datetime import datetime, timezone
 from math import gcd
 from collections import deque
@@ -50,6 +52,30 @@ from .policy import PolicySelector, parse_policy_rules, policy_counts
 from .segments import SegmentTag, build_segment_maps
 
 SUBSCRIBE_VARIANTS = ("A", "B", "C")
+
+
+def _default_user_agent_header() -> str | None:
+    with contextlib.suppress(Exception):
+        import websockets.http11 as http11
+
+        user_agent = getattr(http11, "USER_AGENT", None)
+        if user_agent:
+            return user_agent
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        with contextlib.suppress(Exception):
+            from websockets.legacy.client import USER_AGENT
+
+            return USER_AGENT
+    return None
+
+
+DEFAULT_USER_AGENT_HEADER = _default_user_agent_header()
+CONNECT_SUPPORTS_CLOSE_TIMEOUT = (
+    "close_timeout" in inspect.signature(websockets.connect).parameters
+)
+DEFAULT_WS_CLOSE_TIMEOUT_SECONDS = 5.0
+
 
 FATAL_LOW_DISK = "LOW_DISK"
 FATAL_DROP = "DROP"
@@ -200,6 +226,63 @@ def _mark_reconnecting(shard: ShardState) -> None:
     shard.confirm_deadline_mono_ns = None
     shard.last_subscribe_variant = None
     shard.last_subscribe_group_index = None
+
+
+class _DataIdleTimeout(TimeoutError):
+    pass
+
+
+def _normalize_ws_keepalive(config: Config) -> tuple[float | None, float | None, float | None]:
+    ping_interval = config.ws_ping_interval_seconds
+    if ping_interval <= 0:
+        ping_interval = None
+    ping_timeout = config.ws_ping_timeout_seconds
+    if ping_timeout <= 0:
+        ping_timeout = None
+    data_idle_reconnect = config.ws_data_idle_reconnect_seconds
+    if data_idle_reconnect <= 0:
+        data_idle_reconnect = None
+    return ping_interval, ping_timeout, data_idle_reconnect
+
+
+def _looks_like_ping_timeout(exc: Exception) -> bool:
+    reason = getattr(exc, "reason", None)
+    if reason:
+        reason_text = str(reason).lower()
+        if "ping" in reason_text and "timeout" in reason_text:
+            return True
+    message = str(exc).lower()
+    return "ping" in message and "timeout" in message
+
+
+def _close_was_clean(exc: Exception) -> bool | None:
+    if isinstance(exc, websockets.exceptions.ConnectionClosedOK):
+        return True
+    if isinstance(exc, websockets.exceptions.ConnectionClosedError):
+        return False
+    return None
+
+
+def _extract_close_details(exc: Exception) -> tuple[int | None, str | None, bool | None]:
+    if isinstance(exc, websockets.exceptions.ConnectionClosed):
+        return (
+            getattr(exc, "code", None),
+            getattr(exc, "reason", None),
+            _close_was_clean(exc),
+        )
+    return None, None, None
+
+
+def _classify_reconnect_trigger(exc: Exception) -> str:
+    if isinstance(exc, _DataIdleTimeout):
+        return "data_idle_timeout"
+    if isinstance(exc, TimeoutError) and str(exc) == "subscribe confirmation timeout":
+        return "confirm_timeout"
+    if isinstance(exc, websockets.exceptions.ConnectionClosed):
+        if _looks_like_ping_timeout(exc):
+            return "ping_timeout"
+        return "exception"
+    return "exception"
 
 
 def _apply_churn_guard_policy(
@@ -1864,9 +1947,34 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                 shard.subscribe_variant_index % len(SUBSCRIBE_VARIANTS)
             ]
         refresh_applied = False
+        ping_interval, ping_timeout, data_idle_reconnect_seconds = _normalize_ws_keepalive(
+            state.config
+        )
+        connect_kwargs: dict[str, Any] = {
+            "ping_interval": ping_interval,
+            "ping_timeout": ping_timeout,
+        }
+        if CONNECT_SUPPORTS_CLOSE_TIMEOUT:
+            connect_kwargs["close_timeout"] = DEFAULT_WS_CLOSE_TIMEOUT_SECONDS
         try:
-            async with websockets.connect(state.config.clob_ws_url) as ws:
+            async with websockets.connect(
+                state.config.clob_ws_url,
+                **connect_kwargs,
+            ) as ws:
                 _mark_reconnecting(shard)
+                _write_runlog(
+                    run_dir,
+                    {
+                        "record_type": "ws_connect",
+                        "run_id": state.run.run_id,
+                        "shard_id": shard.shard_id,
+                        "ws_url": state.config.clob_ws_url,
+                        "user_agent_header": DEFAULT_USER_AGENT_HEADER,
+                        "ping_interval_seconds": ping_interval,
+                        "ping_timeout_seconds": ping_timeout,
+                        "data_idle_reconnect_seconds": data_idle_reconnect_seconds,
+                    },
+                )
                 shard.last_subscribe_variant = variant
                 shard.last_subscribe_group_index = None
                 shard.confirm_deadline_mono_ns = (
@@ -1905,6 +2013,13 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                         },
                     )
 
+                data_idle_reconnect_ns = None
+                if data_idle_reconnect_seconds is not None:
+                    data_idle_reconnect_ns = int(
+                        data_idle_reconnect_seconds * 1_000_000_000
+                    )
+                last_rx_mono_ns = monotonic_ns()
+
                 while not state.fatal_event.is_set() and not state.stop_event.is_set():
                     if _refresh_requested(shard):
                         refresh_applied = _apply_shard_refresh(state, shard)
@@ -1913,14 +2028,30 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                     if state.stop_event.is_set():
                         await ws.close()
                         break
-                    await _check_confirm_deadline(monotonic_ns())
+                    now_ns = monotonic_ns()
+                    await _check_confirm_deadline(now_ns)
+                    recv_timeout = 1.0
+                    if data_idle_reconnect_ns is not None:
+                        idle_elapsed_ns = now_ns - last_rx_mono_ns
+                        remaining_idle_ns = data_idle_reconnect_ns - idle_elapsed_ns
+                        if remaining_idle_ns <= 0:
+                            raise _DataIdleTimeout("data idle timeout")
+                        recv_timeout = min(
+                            recv_timeout,
+                            remaining_idle_ns / 1_000_000_000,
+                        )
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                        raw = await asyncio.wait_for(ws.recv(), timeout=recv_timeout)
                     except asyncio.TimeoutError:
-                        await _check_confirm_deadline(monotonic_ns())
+                        now_ns = monotonic_ns()
+                        await _check_confirm_deadline(now_ns)
+                        if data_idle_reconnect_ns is not None:
+                            if now_ns - last_rx_mono_ns >= data_idle_reconnect_ns:
+                                raise _DataIdleTimeout("data idle timeout")
                         continue
 
                     rx_mono_ns = monotonic_ns()
+                    last_rx_mono_ns = rx_mono_ns
                     rx_wall_ns_utc = time.time_ns()
                     await _check_confirm_deadline(monotonic_ns())
                     _handle_payload(
@@ -1937,6 +2068,8 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                 break
             _mark_reconnecting(shard)
             shard.reconnects += 1
+            trigger = _classify_reconnect_trigger(exc)
+            close_code, close_reason, close_was_clean = _extract_close_details(exc)
             _write_runlog(
                 run_dir,
                 {
@@ -1944,6 +2077,13 @@ async def _run_shard(state: CaptureState, shard: ShardState) -> None:
                     "run_id": state.run.run_id,
                     "shard_id": shard.shard_id,
                     "reason": type(exc).__name__,
+                    "trigger": trigger,
+                    "close_code": close_code,
+                    "close_reason": close_reason,
+                    "close_was_clean": close_was_clean,
+                    "ping_interval_seconds": ping_interval,
+                    "ping_timeout_seconds": ping_timeout,
+                    "data_idle_reconnect_seconds": data_idle_reconnect_seconds,
                     "reconnects": shard.reconnects,
                 },
             )

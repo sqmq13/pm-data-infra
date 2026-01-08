@@ -42,6 +42,9 @@ class Config:
     ws_subscribe_max_bytes: int = 32768
     ws_reconnect_max: int = 10
     ws_reconnect_backoff_seconds: float = 1.0
+    ws_ping_interval_seconds: float = 20.0
+    ws_ping_timeout_seconds: float = 20.0
+    ws_data_idle_reconnect_seconds: float = 120.0
     capture_frames_schema_version: int = 2
     capture_max_markets: int = 5000
     capture_confirm_tokens_per_shard: int = 25

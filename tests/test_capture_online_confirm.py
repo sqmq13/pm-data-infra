@@ -2,6 +2,7 @@ import asyncio
 import json
 import time
 from collections import deque
+from typing import Any
 
 import pytest
 
@@ -195,6 +196,39 @@ async def test_confirm_success_logs_variant_from_subscribe_attempt(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_connect_kwargs_include_keepalive(tmp_path, monkeypatch):
+    config = Config(
+        capture_confirm_min_events=1,
+        ws_reconnect_backoff_seconds=0.0,
+        ws_ping_interval_seconds=12.0,
+        ws_ping_timeout_seconds=7.0,
+    )
+    groups = [["t1"]]
+    state, shard, _run_dir = _build_state(tmp_path, groups=groups, config=config)
+    ws = FakeWebSocket(
+        [b'{"event_type":"book","asset_id":"t1"}'],
+        on_recv=state.stop_event.set,
+    )
+    seen: dict[str, Any] = {}
+
+    def fake_connect(*args, **kwargs):
+        seen.update(kwargs)
+        return FakeConnect(ws)
+
+    monkeypatch.setattr(capture_online.websockets, "connect", fake_connect)
+
+    await asyncio.wait_for(capture_online._run_shard(state, shard), timeout=2.0)
+
+    assert "ping_interval" in seen
+    assert "ping_timeout" in seen
+    assert seen["ping_interval"] == config.ws_ping_interval_seconds
+    assert seen["ping_timeout"] == config.ws_ping_timeout_seconds
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
 async def test_variant_sticky_after_confirm_reconnect(tmp_path, monkeypatch):
     config = Config(capture_confirm_min_events=1, ws_reconnect_backoff_seconds=0.0)
     groups = [["t1"]]
@@ -227,6 +261,77 @@ async def test_variant_sticky_after_confirm_reconnect(tmp_path, monkeypatch):
     assert len(attempt_records) >= 2
     first_variant = attempt_records[0]["variant"]
     assert all(record["variant"] == first_variant for record in attempt_records)
+
+    shard.frames_fh.close()
+    shard.idx_fh.close()
+
+
+@pytest.mark.asyncio
+async def test_data_idle_watchdog_forces_reconnect_and_is_logged(tmp_path, monkeypatch):
+    config = Config(
+        capture_confirm_timeout_seconds=999.0,
+        capture_confirm_min_events=1,
+        ws_reconnect_backoff_seconds=0.0,
+        ws_data_idle_reconnect_seconds=0.05,
+    )
+    groups = [["t1"]]
+    state, shard, run_dir = _build_state(tmp_path, groups=groups, config=config)
+
+    class BlockingWebSocket:
+        def __init__(self):
+            self._event = asyncio.Event()
+            self.sent = []
+            self.closed = False
+
+        async def send(self, data):
+            self.sent.append(data)
+
+        async def recv(self):
+            await self._event.wait()
+            return b""
+
+        async def close(self):
+            self.closed = True
+
+    first_ws = BlockingWebSocket()
+    second_ws = FakeWebSocket(
+        [b'{"event_type":"book","asset_id":"t1"}'],
+        on_recv=state.stop_event.set,
+    )
+    connections = deque([first_ws, second_ws])
+    connect_calls = {"count": 0}
+
+    def fake_connect(*args, **kwargs):
+        connect_calls["count"] += 1
+        if not connections:
+            raise AssertionError("unexpected websocket connect")
+        return FakeConnect(connections.popleft())
+
+    monkeypatch.setattr(capture_online.websockets, "connect", fake_connect)
+
+    await asyncio.wait_for(capture_online._run_shard(state, shard), timeout=2.0)
+
+    records = [
+        json.loads(line)
+        for line in (run_dir / "runlog.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    reconnect_records = [
+        record for record in records if record.get("record_type") == "reconnect"
+    ]
+    assert reconnect_records
+    idle_records = [
+        record
+        for record in reconnect_records
+        if record.get("trigger") == "data_idle_timeout"
+    ]
+    assert idle_records
+    idle_record = idle_records[0]
+    assert "close_code" in idle_record
+    assert "close_reason" in idle_record
+    assert connect_calls["count"] >= 2
 
     shard.frames_fh.close()
     shard.idx_fh.close()
