@@ -42,8 +42,8 @@ class Config:
     ws_subscribe_max_bytes: int = 32768
     ws_reconnect_max: int = 10
     ws_reconnect_backoff_seconds: float = 1.0
-    ws_ping_interval_seconds: float = 20.0
-    ws_ping_timeout_seconds: float = 20.0
+    ws_ping_interval_seconds: float = 10.0
+    ws_ping_timeout_seconds: float = 10.0
     ws_data_idle_reconnect_seconds: float = 120.0
     capture_frames_schema_version: int = 2
     capture_max_markets: int = 2000
@@ -56,7 +56,7 @@ class Config:
     capture_metrics_max_samples: int = 5000
     capture_heartbeat_interval_seconds: float = 1.0
     capture_gc_disable: bool = True
-    capture_universe_refresh_enable: bool = False
+    capture_universe_refresh_enable: bool = True
     capture_universe_refresh_interval_seconds: float = 60.0
     capture_universe_refresh_timeout_seconds: float = 30.0
     capture_universe_refresh_stagger_seconds: float = 0.25

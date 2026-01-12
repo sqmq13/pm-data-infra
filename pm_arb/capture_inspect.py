@@ -425,6 +425,12 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
             "ws_rx_to_applied_ms": _latency_series_summary(
                 metrics_records, "ws_rx_to_applied_ms"
             ),
+            "write_end_to_apply_ms": _latency_series_summary(
+                metrics_records, "write_end_to_apply_ms"
+            ),
+            "apply_update_ms": _latency_series_summary(
+                metrics_records, "apply_update_ms"
+            ),
         },
         "queue_depth": {
             "ws_in_q_depth": ws_in_q_stats,

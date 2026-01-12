@@ -5,7 +5,6 @@ import contextlib
 import functools
 import hashlib
 import inspect
-import json
 import gc
 import os
 import platform
@@ -22,7 +21,7 @@ from datetime import datetime, timezone
 from math import gcd, ceil
 from collections import deque
 from statistics import mean
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -66,6 +65,29 @@ _IO_WRITER_STOP = object()
 _IO_WRITER: "_NdjsonWriter | None" = None
 _PARSE_WORKER_STOP = object()
 _FRAME_WRITE_STOP = object()
+_ORJSON_NDJSON_OPTIONS = orjson.OPT_APPEND_NEWLINE
+if hasattr(orjson, "OPT_ESCAPE_NON_ASCII"):
+    _ORJSON_NDJSON_OPTIONS |= orjson.OPT_ESCAPE_NON_ASCII
+
+
+def _normalize_orjson(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, bytearray):
+        return bytes(value).hex()
+    if isinstance(value, memoryview):
+        return value.tobytes().hex()
+    if is_dataclass(value) and not isinstance(value, type):
+        return _normalize_orjson(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _normalize_orjson(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset, deque)):
+        return [_normalize_orjson(item) for item in value]
+    return str(value)
 
 
 @dataclass(frozen=True)
@@ -378,12 +400,8 @@ class _NdjsonWriter:
                     break
                 if item is not None:
                     path_text, record = item
-                    line = json.dumps(
-                        record,
-                        ensure_ascii=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                    pending.setdefault(path_text, []).append(line + b"\n")
+                    line = orjson.dumps(record, option=_ORJSON_NDJSON_OPTIONS)
+                    pending.setdefault(path_text, []).append(line)
                     pending_count += 1
                 now = time.time()
                 if (
@@ -629,6 +647,8 @@ class CaptureState:
     ws_rx_to_enqueue_ms_samples: deque[float] = field(default_factory=deque)
     ws_rx_to_parsed_ms_samples: deque[float] = field(default_factory=deque)
     ws_rx_to_applied_ms_samples: deque[float] = field(default_factory=deque)
+    write_end_to_apply_ms_samples: deque[float] = field(default_factory=deque)
+    apply_update_ms_samples: deque[float] = field(default_factory=deque)
     ws_in_q_depth_samples: deque[int] = field(default_factory=deque)
     parse_q_depth_samples: deque[int] = field(default_factory=deque)
     write_q_depth_samples: deque[int] = field(default_factory=deque)
@@ -1658,17 +1678,19 @@ def _build_missing_tokens_dump(
 
 
 def _write_runlog(run_dir: Path, record: dict[str, Any]) -> None:
+    normalized = _normalize_orjson(record)
     if _IO_WRITER is not None:
-        _IO_WRITER.enqueue(run_dir / "runlog.ndjson", record)
+        _IO_WRITER.enqueue(run_dir / "runlog.ndjson", normalized)
         return
-    _append_ndjson(run_dir / "runlog.ndjson", record)
+    _append_ndjson(run_dir / "runlog.ndjson", normalized)
 
 
 def _write_metrics(path: Path, record: dict[str, Any]) -> None:
+    normalized = _normalize_orjson(record)
     if _IO_WRITER is not None:
-        _IO_WRITER.enqueue(path, record)
+        _IO_WRITER.enqueue(path, normalized)
         return
-    _append_ndjson(path, record)
+    _append_ndjson(path, normalized)
 
 
 def _write_startup_fatal(
@@ -1903,6 +1925,19 @@ async def _write_results_loop(state: CaptureState) -> None:
                 applied_latency_ms,
                 state.config.capture_metrics_max_samples,
             )
+            write_end_to_apply_ms = max(
+                0.0,
+                (
+                    t_applied_mono_ns
+                    - (result.rx_mono_ns + result.ingest_latency_ns)
+                )
+                / 1_000_000.0,
+            )
+            _append_sample_float(
+                state.write_end_to_apply_ms_samples,
+                write_end_to_apply_ms,
+                state.config.capture_metrics_max_samples,
+            )
             shard = state.shards[result.shard_id]
             shard.stats.record(
                 result.payload_len,
@@ -1919,6 +1954,15 @@ async def _write_results_loop(state: CaptureState) -> None:
             _append_sample(
                 state.write_q_depth_samples,
                 writer.results_size(),
+                state.config.capture_metrics_max_samples,
+            )
+            apply_done_mono_ns = monotonic_ns()
+            apply_update_ms = max(
+                0.0, (apply_done_mono_ns - t_applied_mono_ns) / 1_000_000.0
+            )
+            _append_sample_float(
+                state.apply_update_ms_samples,
+                apply_update_ms,
                 state.config.capture_metrics_max_samples,
             )
         if processed == 0:
@@ -2138,18 +2182,24 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         enqueue_samples = list(state.ws_rx_to_enqueue_ms_samples)
         parsed_samples = list(state.ws_rx_to_parsed_ms_samples)
         applied_samples = list(state.ws_rx_to_applied_ms_samples)
+        write_end_to_apply_samples = list(state.write_end_to_apply_ms_samples)
+        apply_update_samples = list(state.apply_update_ms_samples)
         ws_in_q_samples = list(state.ws_in_q_depth_samples)
         parse_q_samples = list(state.parse_q_depth_samples)
         write_q_samples = list(state.write_q_depth_samples)
         enqueue_stats = _quantiles_with_mean(enqueue_samples)
         parsed_stats = _quantiles_with_mean(parsed_samples)
         applied_stats = _quantiles_with_mean(applied_samples)
+        write_end_to_apply_stats = _quantiles_with_mean(write_end_to_apply_samples)
+        apply_update_stats = _quantiles_with_mean(apply_update_samples)
         ws_in_q_quantiles = _quantiles_from_samples_any(ws_in_q_samples, (95,))
         parse_q_quantiles = _quantiles_from_samples_any(parse_q_samples, (95,))
         write_q_quantiles = _quantiles_from_samples_any(write_q_samples, (95,))
         enqueue_max = enqueue_stats["max"]
         parsed_max = parsed_stats["max"]
         applied_max = applied_stats["max"]
+        write_end_to_apply_max = write_end_to_apply_stats["max"]
+        apply_update_max = apply_update_stats["max"]
         ws_in_q_max = max(ws_in_q_samples) if ws_in_q_samples else 0
         parse_q_max = max(parse_q_samples) if parse_q_samples else 0
         write_q_max = max(write_q_samples) if write_q_samples else 0
@@ -2161,6 +2211,8 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         state.ws_rx_to_enqueue_ms_samples.clear()
         state.ws_rx_to_parsed_ms_samples.clear()
         state.ws_rx_to_applied_ms_samples.clear()
+        state.write_end_to_apply_ms_samples.clear()
+        state.apply_update_ms_samples.clear()
         state.ws_in_q_depth_samples.clear()
         state.parse_q_depth_samples.clear()
         state.write_q_depth_samples.clear()
@@ -2254,6 +2306,18 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "ws_rx_to_applied_ms_p99": applied_stats["p99"],
             "ws_rx_to_applied_ms_max": applied_max,
             "ws_rx_to_applied_ms_count": len(applied_samples),
+            "write_end_to_apply_ms_mean": write_end_to_apply_stats["mean"],
+            "write_end_to_apply_ms_p50": write_end_to_apply_stats["p50"],
+            "write_end_to_apply_ms_p95": write_end_to_apply_stats["p95"],
+            "write_end_to_apply_ms_p99": write_end_to_apply_stats["p99"],
+            "write_end_to_apply_ms_max": write_end_to_apply_max,
+            "write_end_to_apply_ms_count": len(write_end_to_apply_samples),
+            "apply_update_ms_mean": apply_update_stats["mean"],
+            "apply_update_ms_p50": apply_update_stats["p50"],
+            "apply_update_ms_p95": apply_update_stats["p95"],
+            "apply_update_ms_p99": apply_update_stats["p99"],
+            "apply_update_ms_max": apply_update_max,
+            "apply_update_ms_count": len(apply_update_samples),
             "ws_in_q_depth_p95": ws_in_q_quantiles[95],
             "ws_in_q_depth_max": ws_in_q_max,
             "parse_q_depth_p95": parse_q_quantiles[95],
