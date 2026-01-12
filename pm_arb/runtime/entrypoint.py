@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -36,6 +38,30 @@ class RunSummary:
     callback_stats: Mapping[str, dict[str, float | int]] | None = None
     submitted_intents: int | None = None
     pnl_summary: Mapping[str, object] | None = None
+
+
+def format_run_summary(summary: RunSummary, *, stable: bool) -> str:
+    payload = OrderedDict()
+    payload["ok"] = summary.ok
+    payload["mode"] = summary.mode
+    payload["execution"] = summary.execution
+    payload["canonical_events"] = summary.canonical_events
+    payload["intents"] = summary.intents
+    payload["final_hash"] = summary.final_hash
+    payload["elapsed_ms"] = 0 if stable else summary.elapsed_ms
+    if summary.reconnects is not None:
+        payload["reconnects"] = summary.reconnects
+    if summary.decode_errors is not None:
+        payload["decode_errors"] = summary.decode_errors
+    if summary.callback_stats is not None:
+        payload["callback_stats"] = summary.callback_stats
+    if summary.submitted_intents is not None:
+        payload["submitted_intents"] = summary.submitted_intents
+    if summary.pnl_summary is not None:
+        payload["pnl"] = summary.pnl_summary
+    if summary.error:
+        payload["error"] = summary.error
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
 def _build_strategies(

@@ -2,10 +2,9 @@
 
 ## 1. Scope / system overview
 - Phase 1 capture plant for Polymarket CLOB WS frames (active-binary YES/NO).
-- Multi-shard WS capture with raw payload bytes plus per-frame `rx_mono_ns` and `rx_wall_ns_utc`.
-- Run bundles live under `data/runs/<run_id>/` (rooted at `data_dir`) with stable layout.
-- Integrity verification, audit, and latency reporting are first-class (`capture-verify`, `capture-audit`, `capture-latency-report`).
-- No trading, signing, or data-rewriting transforms; payload bytes are preserved as received.
+- Phase 2 runtime pipeline that streams live or replay data into strategies with sim execution only.
+- Strategy layer is transport-agnostic: it sees the same canonical event stream for live or replay.
+- No live execution backend; simulation only.
 
 Run bundle layout (online capture):
 - `manifest.json` (run metadata, config snapshot, universe metadata).
@@ -15,19 +14,96 @@ Run bundle layout (online capture):
 - `latency_report.json` and `latency_report.txt` (created by `capture-latency-report`).
 - On fatal runs: `fatal.json`, `missing_tokens.json`, `last_frames_shard_<NN>.bin`.
 
-## 2. Quickstart (uv)
+Runtime run outputs:
+- No disk output by default for replay or live.
+- Determinism hashes and optional PnL summaries are emitted to stdout as a single JSON line.
+
+## 2. Runtime architecture (streaming)
+Pipeline:
+1) DataSource: `LiveDataSource` or `ReplayDataSource`.
+2) Normalizer: raw payload bytes -> canonical events (deltas only).
+3) StateStore: in-memory `MarketState` and `GlobalState`.
+4) Strategy API: callbacks emit intents (no WS/capture/execution imports).
+5) Allocator: deterministic merge and limits.
+6) SimExecutionBackend: ack + conservative fills for taker intents only.
+7) Ledger: fixed-point PnL, conservative mark.
+
+Strategies are disabled by default and must be explicitly enabled via `--strategy`.
+
+## 3. Canonical events + fixed-point e6
+Canonical event (hot path):
+```
+TopOfBookUpdate:
+  market_id
+  bid_px_e6, bid_sz_e6, ask_px_e6, ask_sz_e6
+  ts_event (exchange) or None
+  ts_recv (local monotone)
+  seq (assigned by orchestrator)
+```
+All price/size values are fixed-point e6 integers; no floats on the hot path.
+`to_e6` uses round-half-up quantization in the normalizer.
+
+ToB extraction rule (hybrid):
+- For bids: if `len(bids) >= 2` and `bids[0].price < bids[1].price`, scan once for max; otherwise take `bids[0]`.
+- For asks: if `len(asks) >= 2` and `asks[0].price > asks[1].price`, scan once for min; otherwise take `asks[0]`.
+
+## 4. Determinism rules
+- Replay merge ordering across shards is `(rx_mono_ns, shard_id, idx_i)`.
+- Canonical event seq is assigned by the orchestrator in processing order.
+- Intent hash format (one line per intent) is defined in `pm_arb/runtime/entrypoint.py`:
+  `seq|strategy_id|intent_type|market_id|side|price_e6|size_e6|tif|urgency|tag`.
+- Execution ack events are excluded from the hash.
+
+Stable output:
+- Use `--stable-json` for replay output to make the JSON line byte-identical across runs.
+- Stable output keeps the same keys but forces `elapsed_ms` to a constant integer.
+
+## 5. CLI inventory
+Capture:
+- `discover`
+- `capture`
+- `capture-verify`
+- `capture-bench`
+- `capture-inspect`
+- `capture-audit`
+- `capture-latency-report`
+- `capture-slice`
+
+Runtime:
+- `run` (replay or live, sim execution only)
+
+## 6. Runtime commands (no disk output)
+Replay sim (prints hash, optional PnL):
 ```bash
-uv sync
-uv run pm_arb --help
+uv run pm_arb run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --max-seconds 300 --print-hash
+uv run pm_arb run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --max-seconds 300 --print-hash --print-pnl --strategy toy_spread
 ```
 
-Optional uvloop install (non-Windows) and verification:
+Live sim dry run (prints summary JSON):
 ```bash
-uv pip install uvloop
-uv run python -c "import uvloop"
+uv run pm_arb run --mode live --execution sim --duration-seconds 300 --print-summary-json
 ```
 
-## 3. Configuration
+Notes:
+- Replay and live runtime do not write to `data/runs/*`.
+- `--max-events` caps canonical events (not raw frames).
+- Strategies are enabled explicitly via `--strategy`.
+
+## 7. Determinism audit snippet (macOS + Ubuntu)
+```bash
+RUN_DIR="data/runs/<RUN_ID>"
+OUT1="$(uv run pm_arb run --mode replay --execution sim --run-dir "$RUN_DIR" --max-seconds 300 --print-hash --print-pnl --strategy toy_spread --stable-json)"
+OUT2="$(uv run pm_arb run --mode replay --execution sim --run-dir "$RUN_DIR" --max-seconds 300 --print-hash --print-pnl --strategy toy_spread --stable-json)"
+test "$OUT1" = "$OUT2" && echo PASS || echo FAIL
+```
+
+## 8. Sim execution + ledger (conservative)
+- Taker intents fill against current ToB with a slippage buffer (bps) and optional size cap.
+- Maker intents do not fill by default.
+- Fees use a `FeeModel` hook (default flat bps).
+- Ledger is fixed-point; marks are conservative (bid for longs, ask for shorts).
+
+## 9. Capture configuration (Phase 1)
 Configuration comes from the `Config` dataclass in `pm_arb/config.py`.
 
 Workflow:
@@ -51,47 +127,13 @@ Key settings and defaults:
 | Max markets safety cap | `PM_ARB_CAPTURE_MAX_MARKETS` | `--capture-max-markets` | `2000` | Upper bound on active-binary universe. |
 | Data directory | `PM_ARB_DATA_DIR` | `--data-dir` | `./data` | Run bundle root. |
 
-Universe refresh tuning knobs (defaults are sane; change only when needed):
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_TIMEOUT_SECONDS` (30.0)
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_STAGGER_SECONDS` (0.25)
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_GRACE_SECONDS` (30.0)
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_MIN_DELTA_TOKENS` (2)
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_MAX_CHURN_PCT` (10.0)
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_MAX_INTERVAL_SECONDS` (600.0)
-- `PM_ARB_CAPTURE_UNIVERSE_REFRESH_CHURN_GUARD_CONSECUTIVE_FATAL` (5)
-
-## 4. CLI inventory
-All CLI subcommands (from `pm_arb/cli.py`):
-- `discover`: print active-binary universe candidates from Gamma.
-- `capture`: online capture (or offline when `--offline`).
-- `capture-verify`: validate frames/idx files and CRCs.
-- `capture-bench`: offline ingest bench using fixtures.
-- `capture-inspect`: summarize run bundle sizes and metrics tails.
-- `capture-audit`: heartbeat gap audit on `runlog.ndjson`.
-- `capture-latency-report`: generate `latency_report.json`/`.txt`.
-- `capture-slice`: extract a slice from a run (by time or offset).
-
-## 5. Operations playbook
-tmux workflow:
+## 10. Capture operations playbook (Phase 1)
+Capture run (stop after ~10 minutes with Ctrl-C):
 ```bash
-tmux new -s pm-arb
-```
-Detach with `Ctrl-b d`, then reattach later:
-```bash
-tmux attach -t pm-arb
+uv run pm_arb capture --run-id run-10m
 ```
 
-10-minute run (SIGINT via timeout):
-```bash
-timeout --signal=INT 10m uv run pm_arb capture --run-id run-10m
-```
-
-1-hour run (SIGINT via timeout):
-```bash
-timeout --signal=INT 1h uv run pm_arb capture --run-id run-1h
-```
-
-Post-run audits (set `RUN_DIR` to the printed run dir):
+Post-run audit:
 ```bash
 RUN_DIR="data/runs/<run_id>"
 uv run pm_arb capture-verify --run-dir "$RUN_DIR" --summary-only
@@ -99,7 +141,7 @@ uv run pm_arb capture-audit --run-dir "$RUN_DIR"
 uv run pm_arb capture-latency-report --run-dir "$RUN_DIR"
 ```
 
-## 6. Data quality gates vs latency tuning
+## 11. Data quality gates vs latency tuning (capture)
 FAIL gates (any one is a failure):
 - Heartbeat gaps over 2s (`capture-audit` with default threshold reports `gaps_over_threshold > 0`).
 - Reconnects midrun (`capture-latency-report` shows `reconnects.total > 0` or `disconnected.midrun.incidents > 0`).
@@ -107,39 +149,16 @@ FAIL gates (any one is a failure):
 - CRC mismatch (`capture-verify` shows `totals.crc_mismatch > 0`).
 - `fatal.json` exists in the run directory.
 
-Loop lag alone is not automatic data loss; interpret loop lag alongside drop counters, queue depth, and reconnects.
+## 12. Gate status (completed)
+- Gate 0: repo audit + placement plan.
+- Gate 1: canonical events + state store tests.
+- Gate 2: strategy API + intents tests.
+- Gate 3: allocator + sim execution + orchestrator determinism tests.
+- Gate 4: replay datasource + normalizer + deterministic hash tests.
+- Gate 5: live datasource dry run + summary JSON output.
+- Gate 6: conservative sim fills + deterministic PnL.
 
-## 7. Latency metrics interpretation
-Primary focus:
-- `ws_rx_to_applied_ms` p50/p95/p99/max from `latency_report.json`.
-- Queue depth stats: `ws_in_q_depth`, `parse_q_depth`, `write_q_depth`.
-- Drop counters: `drops.dropped_messages_total` and per-interval counts.
-
-What "bad" looks like:
-- Rising p95/p99/max together with growing queue depth.
-- Any sustained queue growth paired with non-zero drops or reconnects.
-
-## 8. Universe refresh behavior (current behavior)
-When enabled, refresh periodically:
-- Fetches Gamma, recomputes the active-binary universe, and computes deltas.
-- Only shards with changed token sets reconnect; reconnects are staggered.
-- New tokens are excluded from coverage calculations until the grace window elapses.
-
-Runlog records to watch:
-- `universe_refresh` includes `duration_ms`, `reason`, `added_count`, `removed_count`,
-  `churn_pct`, `interval_seconds_used`, `gamma_pages_fetched`, `markets_seen`,
-  and `tokens_selected`.
-- `shard_refresh_begin` and `shard_refresh_applied` bracket shard-level updates.
-- `universe_refresh_error` includes `duration_ms`, `error`, and `message`.
-
-Churn guard behavior:
-- If churn exceeds `capture_universe_refresh_max_churn_pct`, the effective interval backs off
-  (up to `capture_universe_refresh_max_interval_seconds`) and may become fatal after
-  `capture_universe_refresh_churn_guard_consecutive_fatal` consecutive guards.
-
-## 9. Troubleshooting
-- uvloop install/verify: `uv pip install uvloop`, then `uv run python -c "import uvloop"`.
-- Missing files in `capture-verify`: confirm the run dir path and that `capture/*.frames` exists.
-- Fatal runs: inspect `fatal.json`, `missing_tokens.json`, and `runlog.ndjson`.
-- Metrics and reports live under `metrics/` and `latency_report.json`/`.txt`.
-- Run bundles are under `data/runs/<run_id>/` unless `PM_ARB_DATA_DIR` overrides `data_dir`.
+## 13. Platform notes
+- Development is on Windows; runtime targets Ubuntu.
+- Commands in this doc are copy/pasteable on macOS and Ubuntu.
+- Live runtime does not write to disk; capture does.
