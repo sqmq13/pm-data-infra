@@ -122,6 +122,8 @@ def _best_ask(levels: list) -> tuple[int | None, int | None]:
 
 @dataclass(slots=True)
 class Normalizer:
+    decode_errors: int = 0
+
     def normalize(self, frame: RawFrame) -> list[TopOfBookUpdate]:
         payload_bytes = frame.payload
         if payload_bytes in (b"PONG", b"PING"):
@@ -129,6 +131,7 @@ class Normalizer:
         try:
             payload = orjson.loads(payload_bytes)
         except orjson.JSONDecodeError:
+            self.decode_errors += 1
             return []
 
         events: list[TopOfBookUpdate] = []

@@ -19,7 +19,7 @@ requires = ["setuptools>=68.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["pm_arb"]
+packages = ["pm_arb", "pm_arb.runtime", "pm_arb.strategies"]
 
 [dependency-groups]
 dev = [

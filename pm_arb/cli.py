@@ -23,6 +23,7 @@ from .capture_online import run_capture_online
 from .capture_format import verify_frames
 from .capture_slice import slice_run
 from .gamma import fetch_markets, select_active_binary_markets
+from .runtime.entrypoint import run_live_sim, run_replay_sim
 
 
 def _is_field_type(field_type, expected: type, expected_name: str) -> bool:
@@ -155,6 +156,22 @@ def main(argv: list[str] | None = None) -> int:
     capture_slice.add_argument("--start-offset", type=int, default=None)
     capture_slice.add_argument("--end-offset", type=int, default=None)
 
+    run = subparsers.add_parser("run", parents=[common])
+    run.add_argument("--mode", required=True, choices=["replay", "live"])
+    run.add_argument("--execution", required=True, choices=["sim"])
+    run.add_argument("--run-dir", default=None)
+    run.add_argument("--max-seconds", type=float, default=None)
+    run.add_argument("--max-events", type=int, default=None)
+    run.add_argument("--duration-seconds", type=float, default=None)
+    run.add_argument("--strategy", action="append", default=None)
+    run.add_argument("--seed", type=int, default=None)
+    run.add_argument("--config", dest="runtime_config", default=None)
+    run.add_argument("--print-hash", action="store_true", default=False)
+    run.add_argument("--print-pnl", action="store_true", default=False)
+    run.add_argument("--print-summary-json", action="store_true", default=False)
+    run.add_argument("--quiet", action="store_true", default=False)
+    run.add_argument("--json", action="store_true", default=False)
+
     args = parser.parse_args(argv)
     overrides = _cli_overrides(args)
     config = Config.from_env_and_cli(overrides, os.environ)
@@ -285,6 +302,67 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(f"slice dir: {result.slice_dir}")
         return 0
+    if args.command == "run":
+        try:
+            if args.mode == "replay":
+                if not args.print_hash:
+                    raise ValueError("--print-hash is required for replay mode")
+                if not args.run_dir:
+                    raise ValueError("--run-dir is required for replay mode")
+                summary = run_replay_sim(
+                    run_dir=Path(args.run_dir),
+                    max_seconds=args.max_seconds,
+                    max_events=args.max_events,
+                    strategy_names=args.strategy,
+                    include_pnl=args.print_pnl,
+                )
+            else:
+                if not args.print_summary_json:
+                    raise ValueError("--print-summary-json is required for live mode")
+                if args.duration_seconds is None:
+                    raise ValueError("--duration-seconds is required for live mode")
+                summary = run_live_sim(
+                    config=config,
+                    duration_seconds=args.duration_seconds,
+                    max_events=args.max_events,
+                    strategy_names=args.strategy,
+                )
+            payload = {
+                "ok": summary.ok,
+                "mode": summary.mode,
+                "execution": summary.execution,
+                "canonical_events": summary.canonical_events,
+                "intents": summary.intents,
+                "final_hash": summary.final_hash,
+                "elapsed_ms": summary.elapsed_ms,
+            }
+            if summary.reconnects is not None:
+                payload["reconnects"] = summary.reconnects
+            if summary.decode_errors is not None:
+                payload["decode_errors"] = summary.decode_errors
+            if summary.callback_stats is not None:
+                payload["callback_stats"] = summary.callback_stats
+            if summary.submitted_intents is not None:
+                payload["submitted_intents"] = summary.submitted_intents
+            if summary.pnl_summary is not None:
+                payload["pnl"] = summary.pnl_summary
+            if summary.error:
+                payload["error"] = summary.error
+            print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+            return 0 if summary.ok else 1
+        except Exception as exc:
+            payload = {
+                "ok": False,
+                "mode": args.mode,
+                "execution": "sim",
+                "canonical_events": 0,
+                "intents": 0,
+                "final_hash": "",
+                "elapsed_ms": 0.0,
+                "error": str(exc),
+            }
+            print(json.dumps(payload, ensure_ascii=True, separators=(",", ":")))
+            return 2
     return 1
 
 

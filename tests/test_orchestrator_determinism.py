@@ -3,7 +3,7 @@ from pm_arb.runtime.events import TopOfBookUpdate
 from pm_arb.runtime.execution_sim import SimExecutionBackend
 from pm_arb.runtime.intents import Intent, PlaceOrderIntent
 from pm_arb.runtime.orchestrator import Orchestrator
-from pm_arb.runtime.state import MarketState
+from pm_arb.runtime.state import GlobalState, MarketState
 from pm_arb.runtime.strategy import PortfolioView, StrategyContext
 
 
@@ -75,10 +75,12 @@ def _build_events() -> list[TopOfBookUpdate]:
 
 def _run_once():
     clock = StepClock()
+    state = GlobalState()
     orchestrator = Orchestrator(
         strategies={"b": EchoStrategy("b"), "a": EchoStrategy("a")},
         allocator=Allocator(),
-        execution=SimExecutionBackend(),
+        execution=SimExecutionBackend(state=state),
+        state=state,
         now_ns=clock,
         clock_ns=clock,
     )

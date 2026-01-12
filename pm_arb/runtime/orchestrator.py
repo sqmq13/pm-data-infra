@@ -92,6 +92,39 @@ class Orchestrator:
             balances=self._state.balances,
         )
 
+    def process_event(
+        self, event: TopOfBookUpdate
+    ) -> tuple[list[Intent], list[ExecutionEvent]]:
+        self._seq += 1
+        event.seq = self._seq
+        market_state = self._state.get_market(event.market_id)
+        market_state.apply_top_of_book(event)
+        intents_by_strategy: dict[str, list[Intent]] = {}
+        for strategy_id in self._strategy_order:
+            strategy = self._strategies[strategy_id]
+            ctx = self._contexts[strategy_id]
+            start_ns = self._clock_ns()
+            intents = strategy.on_top_of_book(
+                ctx,
+                event,
+                market_state,
+                self._portfolio,
+            )
+            duration_ns = self._clock_ns() - start_ns
+            self._callback_stats[strategy_id].record(
+                duration_ns,
+                self._max_callback_ns,
+                self._overrun_hook,
+                strategy_id,
+            )
+            if intents:
+                intents_by_strategy[strategy_id] = intents
+        merged = self._allocator.merge_intents(intents_by_strategy, self._state)
+        execution_events: list[ExecutionEvent] = []
+        if merged:
+            execution_events = self._execution.submit(merged, self._now_ns())
+        return merged, execution_events
+
     def run_events(self, events: Iterable[TopOfBookUpdate]) -> OrchestratorResult:
         intents_out: list[Intent] = []
         execution_events: list[ExecutionEvent] = []
@@ -99,34 +132,11 @@ class Orchestrator:
 
         for event in events:
             events_processed += 1
-            self._seq += 1
-            event.seq = self._seq
-            market_state = self._state.get_market(event.market_id)
-            market_state.apply_top_of_book(event)
-            intents_by_strategy: dict[str, list[Intent]] = {}
-            for strategy_id in self._strategy_order:
-                strategy = self._strategies[strategy_id]
-                ctx = self._contexts[strategy_id]
-                start_ns = self._clock_ns()
-                intents = strategy.on_top_of_book(
-                    ctx,
-                    event,
-                    market_state,
-                    self._portfolio,
-                )
-                duration_ns = self._clock_ns() - start_ns
-                self._callback_stats[strategy_id].record(
-                    duration_ns,
-                    self._max_callback_ns,
-                    self._overrun_hook,
-                    strategy_id,
-                )
-                if intents:
-                    intents_by_strategy[strategy_id] = intents
-            merged = self._allocator.merge_intents(intents_by_strategy, self._state)
+            merged, exec_events = self.process_event(event)
             if merged:
                 intents_out.extend(merged)
-                execution_events.extend(self._execution.submit(merged, self._now_ns()))
+            if exec_events:
+                execution_events.extend(exec_events)
 
         return OrchestratorResult(
             events_processed=events_processed,
@@ -134,3 +144,6 @@ class Orchestrator:
             execution_events=execution_events,
             callback_stats=self._callback_stats,
         )
+
+    def callback_stats(self) -> Mapping[str, CallbackStats]:
+        return self._callback_stats

@@ -3,7 +3,7 @@ from __future__ import annotations
 import heapq
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import AsyncIterator, Iterable
 
 from pm_arb.capture_format import (
     frames_header_len,
@@ -19,8 +19,8 @@ class RawFrame:
     payload: bytes
     rx_mono_ns: int
     rx_wall_ns_utc: int
-    shard_id: int
-    idx_i: int
+    shard_id: int | None
+    idx_i: int | None = None
 
 
 @dataclass(slots=True)
@@ -151,3 +151,7 @@ class ReplayDataSource:
         finally:
             for stream in streams:
                 stream.frames_fh.close()
+
+    async def stream(self) -> AsyncIterator[RawFrame]:
+        for frame in self.iter_frames():
+            yield frame
