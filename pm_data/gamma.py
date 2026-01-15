@@ -8,7 +8,7 @@ from typing import Any
 
 import requests
 
-DEFAULT_USER_AGENT = "pm-arb-py/phase1"
+DEFAULT_USER_AGENT = "pm-data-infra/phase1"
 
 
 @dataclass(frozen=True)

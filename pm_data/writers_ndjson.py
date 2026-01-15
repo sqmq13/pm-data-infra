@@ -97,7 +97,7 @@ class _NdjsonWriter:
         files: dict[str, Any] = {}
         pending: dict[str, list[bytes]] = {}
         pending_count = 0
-        last_flush = time.time()
+        last_flush = time.monotonic()
         last_fsync = last_flush
         try:
             while True:
@@ -114,7 +114,7 @@ class _NdjsonWriter:
                     line = orjson.dumps(record, option=_ORJSON_NDJSON_OPTIONS)
                     pending.setdefault(path_text, []).append(line)
                     pending_count += 1
-                now = time.time()
+                now = time.monotonic()
                 if (
                     pending_count >= self._batch_size
                     or now - last_flush >= self._flush_interval_seconds

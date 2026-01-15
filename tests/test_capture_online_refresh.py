@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 
 import pytest
 
-from pm_arb.capture import RunBootstrap
-from pm_arb.capture_online import (
+from pm_data.capture import RunBootstrap
+from pm_data.capture_online import (
     CaptureState,
     RefreshPlan,
     ShardState,
@@ -27,10 +27,10 @@ from pm_arb.capture_online import (
     _stable_hash,
     split_subscribe_groups,
 )
-from pm_arb.config import Config
-from pm_arb.fees import FeeRegimeState
-from pm_arb.gamma import UniverseSnapshot
-from pm_arb.segments import build_segment_maps
+from pm_data.config import Config
+from pm_data.fees import FeeRegimeState
+from pm_data.gamma import UniverseSnapshot
+from pm_data.segments import build_segment_maps
 
 
 def test_refresh_delta_min_threshold():
@@ -151,8 +151,8 @@ def test_startup_selection_uses_snapshot(monkeypatch):
         {"id": "m2", "active": True, "enableOrderBook": True, "clobTokenIds": ["t3", "t4"]},
     ]
 
-    monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
-    monkeypatch.setattr("pm_arb.capture_online.fetch_markets", lambda *args, **kwargs: markets)
+    monkeypatch.setattr("pm_data.capture_online.compute_desired_universe", fake_compute)
+    monkeypatch.setattr("pm_data.capture_online.fetch_markets", lambda *args, **kwargs: markets)
 
     config = Config(capture_max_markets=10)
     startup_snapshot, pinned_tokens, pinned_markets, selected_markets, universe_mode = (
@@ -232,8 +232,8 @@ async def test_refresh_noop_does_not_reconnect(tmp_path, monkeypatch):
         state.universe.refresh_cancelled = True
         return snapshot
 
-    monkeypatch.setattr("pm_arb.capture_online.asyncio.sleep", fake_sleep)
-    monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
+    monkeypatch.setattr("pm_data.capture_online.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("pm_data.capture_online.compute_desired_universe", fake_compute)
 
     await _refresh_loop(state)
 
@@ -327,8 +327,8 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
         state.universe.refresh_cancelled = True
         return snapshot
 
-    monkeypatch.setattr("pm_arb.capture_online.asyncio.sleep", fake_sleep)
-    monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
+    monkeypatch.setattr("pm_data.capture_online.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("pm_data.capture_online.compute_desired_universe", fake_compute)
 
     await _refresh_loop(state)
 
@@ -339,7 +339,7 @@ async def test_refresh_skip_below_min_updates_metrics(tmp_path, monkeypatch):
             captured["record"] = record
             state.fatal_event.set()
 
-    monkeypatch.setattr("pm_arb.capture_online._write_metrics", fake_write_metrics)
+    monkeypatch.setattr("pm_data.capture_online._write_metrics", fake_write_metrics)
     await _heartbeat_loop(state)
 
     record = captured["record"]
@@ -437,9 +437,9 @@ async def test_expected_churn_bypasses_guard(tmp_path, monkeypatch):
     boundary = datetime(2024, 1, 1, 0, 15, 30, tzinfo=timezone.utc)
     boundary_ns = int(boundary.timestamp() * 1_000_000_000)
 
-    monkeypatch.setattr("pm_arb.capture_online.asyncio.sleep", fake_sleep)
-    monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
-    monkeypatch.setattr("pm_arb.capture_online.time.time_ns", lambda: boundary_ns)
+    monkeypatch.setattr("pm_data.capture_online.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr("pm_data.capture_online.compute_desired_universe", fake_compute)
+    monkeypatch.setattr("pm_data.capture_online.time.time_ns", lambda: boundary_ns)
 
     await _refresh_loop(state)
 
@@ -574,7 +574,7 @@ async def test_refresh_worker_does_not_block_heartbeat(tmp_path, monkeypatch):
             worker_duration_ms=300.0,
         )
 
-    monkeypatch.setattr("pm_arb.capture_online._compute_refresh_plan_sync", heavy_compute)
+    monkeypatch.setattr("pm_data.capture_online._compute_refresh_plan_sync", heavy_compute)
 
     records: list[dict[str, float]] = []
 
@@ -584,7 +584,7 @@ async def test_refresh_worker_does_not_block_heartbeat(tmp_path, monkeypatch):
             if len(records) >= 6:
                 state.stop_event.set()
 
-    monkeypatch.setattr("pm_arb.capture_online._write_metrics", fake_write_metrics)
+    monkeypatch.setattr("pm_data.capture_online._write_metrics", fake_write_metrics)
 
     tasks = [
         asyncio.create_task(_refresh_loop(state)),

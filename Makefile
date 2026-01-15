@@ -11,10 +11,10 @@ test:
 	$(UV) run python -m pytest
 
 discover:
-	$(UV) run pm_arb discover
+	$(UV) run pm_data discover
 
 capture-bench-offline:
-	$(UV) run pm_arb capture-bench --offline --fixtures-dir testdata/fixtures
+	$(UV) run pm_data capture-bench --offline --fixtures-dir testdata/fixtures
 
 capture-verify:
-	$(UV) run pm_arb capture-verify --run-dir $(RUN_DIR)
+	$(UV) run pm_data capture-verify --run-dir $(RUN_DIR)

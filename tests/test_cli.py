@@ -1,9 +1,9 @@
-import pm_arb.cli as cli
+import pm_data.cli as cli
 
 
 def _run_capture(monkeypatch, args):
     calls = {"offline": None, "capture_offline": 0, "capture_online": 0}
-    monkeypatch.delenv("PM_ARB_OFFLINE", raising=False)
+    monkeypatch.delenv("PM_DATA_OFFLINE", raising=False)
 
     def _capture_offline(config, fixtures_dir, run_id=None, **kwargs):
         calls["offline"] = config.offline

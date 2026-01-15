@@ -5,7 +5,7 @@ import types
 import typing
 from typing import Any, get_args, get_origin
 
-ENV_PREFIX = "PM_ARB_"
+ENV_PREFIX = "PM_DATA_"
 
 
 def _parse_bool(value: str) -> bool:
@@ -72,7 +72,7 @@ class Config:
     ws_ping_interval_seconds: float = 10.0
     ws_ping_timeout_seconds: float = 10.0
     ws_data_idle_reconnect_seconds: float = 120.0
-    ws_user_agent: str = "pm_arb"
+    ws_user_agent: str = "pm_data"
     capture_frames_schema_version: int = 2
     capture_max_markets: int | None = 2000
     capture_confirm_tokens_per_shard: int = 25

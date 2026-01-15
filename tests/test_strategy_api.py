@@ -1,10 +1,10 @@
 import ast
 from pathlib import Path
 
-from pm_arb.runtime.events import TopOfBookUpdate
-from pm_arb.runtime.state import MarketState
-from pm_arb.runtime.strategy import PortfolioView, StrategyContext
-from pm_arb.strategies.toy_spread import ToySpreadStrategy
+from pm_data.runtime.events import TopOfBookUpdate
+from pm_data.runtime.state import MarketState
+from pm_data.runtime.strategy import PortfolioView, StrategyContext
+from pm_data.strategies.toy_spread import ToySpreadStrategy
 
 
 def test_strategy_emits_intent():
@@ -32,16 +32,16 @@ def test_strategy_emits_intent():
 
 
 def test_strategy_no_imports():
-    path = Path("pm_arb/strategies/toy_spread.py")
+    path = Path("pm_data/strategies/toy_spread.py")
     tree = ast.parse(path.read_text(encoding="utf-8"))
     banned_prefixes = (
-        "pm_arb.capture",
-        "pm_arb.clob_ws",
-        "pm_arb.ws_decode",
-        "pm_arb.runtime.execution_sim",
-        "pm_arb.runtime.orchestrator",
-        "pm_arb.runtime.live",
-        "pm_arb.runtime.replay",
+        "pm_data.capture",
+        "pm_data.clob_ws",
+        "pm_data.ws_decode",
+        "pm_data.runtime.execution_sim",
+        "pm_data.runtime.orchestrator",
+        "pm_data.runtime.live",
+        "pm_data.runtime.replay",
     )
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -51,14 +51,14 @@ def test_strategy_no_imports():
             module = node.module or ""
             if module.startswith(banned_prefixes):
                 raise AssertionError(f"banned import: {module}")
-            if module == "pm_arb":
+            if module == "pm_data":
                 for alias in node.names:
                     if alias.name.startswith("capture") or alias.name in {
                         "ws_decode",
                         "clob_ws",
                     }:
-                        raise AssertionError(f"banned import: pm_arb.{alias.name}")
-            if module == "pm_arb.runtime":
+                        raise AssertionError(f"banned import: pm_data.{alias.name}")
+            if module == "pm_data.runtime":
                 for alias in node.names:
                     if alias.name in {"execution_sim", "orchestrator", "live", "replay"}:
-                        raise AssertionError(f"banned import: pm_arb.runtime.{alias.name}")
+                        raise AssertionError(f"banned import: pm_data.runtime.{alias.name}")

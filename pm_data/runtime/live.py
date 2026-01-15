@@ -10,10 +10,10 @@ from typing import Any, AsyncIterator
 import orjson
 import websockets
 
-from pm_arb.clob_ws import build_subscribe_payload
-from pm_arb.config import Config
-from pm_arb.gamma import fetch_markets, parse_clob_token_ids, select_active_binary_markets
-from pm_arb.ws_primitives import (
+from pm_data.clob_ws import build_subscribe_payload
+from pm_data.config import Config
+from pm_data.gamma import fetch_markets, parse_clob_token_ids, select_active_binary_markets
+from pm_data.ws_primitives import (
     DropCounter,
     ReconnectPolicy,
     SUBSCRIBE_VARIANTS,
@@ -59,6 +59,26 @@ def _assign_shards_by_token(token_ids: list[str], shard_count: int) -> dict[int,
     return shards
 
 
+def load_live_tokens(config: Config) -> list[str]:
+    markets = fetch_markets(
+        config.gamma_base_url,
+        config.rest_timeout,
+        limit=config.gamma_limit,
+        max_markets=config.capture_max_markets,
+    )
+    selected = select_active_binary_markets(
+        markets, max_markets=config.capture_max_markets
+    )
+    tokens: set[str] = set()
+    for market in selected:
+        token_ids = parse_clob_token_ids(
+            market.get("clobTokenIds") or market.get("clob_token_ids")
+        )
+        if len(token_ids) != 2:
+            continue
+        for token_id in token_ids:
+            tokens.add(str(token_id))
+    return sorted(tokens)
 
 
 class _ConfirmTimeout(TimeoutError):
@@ -87,39 +107,23 @@ class LiveDataSource:
         config: Config,
         duration_seconds: float,
         max_queue: int = 1000,
+        token_ids: list[str] | None = None,
     ) -> None:
         self._config = config
         self._duration_seconds = duration_seconds
         self._max_queue = max_queue
         self._stats = LiveStats()
+        self._token_ids = list(token_ids) if token_ids is not None else None
 
     @property
     def stats(self) -> LiveStats:
         return self._stats
 
-    def _load_tokens(self) -> list[str]:
-        markets = fetch_markets(
-            self._config.gamma_base_url,
-            self._config.rest_timeout,
-            limit=self._config.gamma_limit,
-            max_markets=self._config.capture_max_markets,
-        )
-        selected = select_active_binary_markets(
-            markets, max_markets=self._config.capture_max_markets
-        )
-        tokens: set[str] = set()
-        for market in selected:
-            token_ids = parse_clob_token_ids(
-                market.get("clobTokenIds") or market.get("clob_token_ids")
-            )
-            if len(token_ids) != 2:
-                continue
-            for token_id in token_ids:
-                tokens.add(str(token_id))
-        return sorted(tokens)
-
     async def stream(self) -> AsyncIterator[RawFrame]:
-        tokens = self._load_tokens()
+        if self._token_ids is None:
+            tokens = await asyncio.to_thread(load_live_tokens, self._config)
+        else:
+            tokens = list(self._token_ids)
         if not tokens:
             raise ValueError("no tokens selected for live subscription")
         shard_map = _assign_shards_by_token(tokens, self._config.ws_shards)

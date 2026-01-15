@@ -1,4 +1,4 @@
-from pm_arb.config import Config
+from pm_data.config import Config
 
 
 def test_default_ws_url():

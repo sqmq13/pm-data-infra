@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from pm_arb.capture_format import verify_frames
-from pm_arb.capture_offline import run_capture_offline
-from pm_arb.config import Config
+from pm_data.capture_format import verify_frames
+from pm_data.capture_offline import run_capture_offline
+from pm_data.config import Config
 
 
 def _repo_root() -> Path:

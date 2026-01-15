@@ -1,7 +1,7 @@
 import pkgutil
 
-import pm_arb
-import pm_arb.cli
+import pm_data
+import pm_data.cli
 
 
 def test_phase1_allowlist() -> None:
@@ -42,6 +42,6 @@ def test_phase1_allowlist() -> None:
         "scan",
         "strategy",
     }
-    modules = {info.name for info in pkgutil.iter_modules(pm_arb.__path__)}
+    modules = {info.name for info in pkgutil.iter_modules(pm_data.__path__)}
     assert modules.issubset(allowlist)
     assert modules.isdisjoint(banned)

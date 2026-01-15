@@ -50,7 +50,7 @@ ToB extraction rule (hybrid):
 ## 4. Determinism rules
 - Replay merge ordering across shards is `(rx_mono_ns, shard_id, idx_i)`.
 - Canonical event seq is assigned by the orchestrator in processing order.
-- Intent hash format (one line per intent) is defined in `pm_arb/runtime/entrypoint.py`:
+- Intent hash format (one line per intent) is defined in `pm_data/runtime/entrypoint.py`:
   `seq|strategy_id|intent_type|market_id|side|price_e6|size_e6|tif|urgency|tag`.
 - Execution ack events are excluded from the hash.
 
@@ -75,13 +75,13 @@ Runtime:
 ## 6. Runtime commands (no disk output)
 Replay sim (prints hash, optional PnL):
 ```bash
-uv run pm_arb run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --max-seconds 300 --print-hash
-uv run pm_arb run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --max-seconds 300 --print-hash --print-pnl --strategy toy_spread
+uv run pm_data run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --max-seconds 300 --print-hash
+uv run pm_data run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --max-seconds 300 --print-hash --print-pnl --strategy toy_spread
 ```
 
 Live sim dry run (prints summary JSON):
 ```bash
-uv run pm_arb run --mode live --execution sim --duration-seconds 300 --print-summary-json
+uv run pm_data run --mode live --execution sim --duration-seconds 300 --print-summary-json
 ```
 
 Notes:
@@ -92,8 +92,8 @@ Notes:
 ## 7. Determinism audit snippet (macOS + Ubuntu)
 ```bash
 RUN_DIR="data/runs/<RUN_ID>"
-OUT1="$(uv run pm_arb run --mode replay --execution sim --run-dir "$RUN_DIR" --max-seconds 300 --print-hash --print-pnl --strategy toy_spread --stable-json)"
-OUT2="$(uv run pm_arb run --mode replay --execution sim --run-dir "$RUN_DIR" --max-seconds 300 --print-hash --print-pnl --strategy toy_spread --stable-json)"
+OUT1="$(uv run pm_data run --mode replay --execution sim --run-dir "$RUN_DIR" --max-seconds 300 --print-hash --print-pnl --strategy toy_spread --stable-json)"
+OUT2="$(uv run pm_data run --mode replay --execution sim --run-dir "$RUN_DIR" --max-seconds 300 --print-hash --print-pnl --strategy toy_spread --stable-json)"
 test "$OUT1" = "$OUT2" && echo PASS || echo FAIL
 ```
 
@@ -104,41 +104,41 @@ test "$OUT1" = "$OUT2" && echo PASS || echo FAIL
 - Ledger is fixed-point; marks are conservative (bid for longs, ask for shorts).
 
 ## 9. Capture configuration (Phase 1)
-Configuration comes from the `Config` dataclass in `pm_arb/config.py`.
+Configuration comes from the `Config` dataclass in `pm_data/config.py`.
 
 Workflow:
 - Defaults are the baseline capture profile; override via env/CLI only when needed.
 - CLI flags use kebab-case (`--ws-shards`, `--capture-max-markets`).
 - Boolean flags use `--<name>` and `--no-<name>`, except `--offline` which accepts `--offline` / `--no-offline`.
-- Environment variables use `PM_ARB_` + uppercase field name (example: `PM_ARB_WS_SHARDS`).
+- Environment variables use `PM_DATA_` + uppercase field name (example: `PM_DATA_WS_SHARDS`).
 - Environment variables override CLI overrides when both are set.
 
 Key settings and defaults:
 | Setting | Env var | CLI flag | Default | Notes |
 | --- | --- | --- | --- | --- |
-| Shard count | `PM_ARB_WS_SHARDS` | `--ws-shards` | `8` | Multi-shard WS capture. |
-| Ping interval | `PM_ARB_WS_PING_INTERVAL_SECONDS` | `--ws-ping-interval-seconds` | `10.0` | Keepalive cadence. |
-| Ping timeout | `PM_ARB_WS_PING_TIMEOUT_SECONDS` | `--ws-ping-timeout-seconds` | `10.0` | Ping response deadline. |
-| Data-idle reconnect | `PM_ARB_WS_DATA_IDLE_RECONNECT_SECONDS` | `--ws-data-idle-reconnect-seconds` | `120.0` | Force reconnect if no data. |
-| Confirm timeout | `PM_ARB_CAPTURE_CONFIRM_TIMEOUT_SECONDS` | `--capture-confirm-timeout-seconds` | `45.0` | Startup confirm window. |
-| Confirm min events | `PM_ARB_CAPTURE_CONFIRM_MIN_EVENTS` | `--capture-confirm-min-events` | `1` | Minimum events to confirm. |
-| Universe refresh enable | `PM_ARB_CAPTURE_UNIVERSE_REFRESH_ENABLE` | `--capture-universe-refresh-enable` | `true` | Enabled by default. |
-| Universe refresh interval | `PM_ARB_CAPTURE_UNIVERSE_REFRESH_INTERVAL_SECONDS` | `--capture-universe-refresh-interval-seconds` | `60.0` | Base refresh cadence. |
-| Max markets safety cap | `PM_ARB_CAPTURE_MAX_MARKETS` | `--capture-max-markets` | `2000` | Upper bound on active-binary universe. |
-| Data directory | `PM_ARB_DATA_DIR` | `--data-dir` | `./data` | Run bundle root. |
+| Shard count | `PM_DATA_WS_SHARDS` | `--ws-shards` | `8` | Multi-shard WS capture. |
+| Ping interval | `PM_DATA_WS_PING_INTERVAL_SECONDS` | `--ws-ping-interval-seconds` | `10.0` | Keepalive cadence. |
+| Ping timeout | `PM_DATA_WS_PING_TIMEOUT_SECONDS` | `--ws-ping-timeout-seconds` | `10.0` | Ping response deadline. |
+| Data-idle reconnect | `PM_DATA_WS_DATA_IDLE_RECONNECT_SECONDS` | `--ws-data-idle-reconnect-seconds` | `120.0` | Force reconnect if no data. |
+| Confirm timeout | `PM_DATA_CAPTURE_CONFIRM_TIMEOUT_SECONDS` | `--capture-confirm-timeout-seconds` | `45.0` | Startup confirm window. |
+| Confirm min events | `PM_DATA_CAPTURE_CONFIRM_MIN_EVENTS` | `--capture-confirm-min-events` | `1` | Minimum events to confirm. |
+| Universe refresh enable | `PM_DATA_CAPTURE_UNIVERSE_REFRESH_ENABLE` | `--capture-universe-refresh-enable` | `true` | Enabled by default. |
+| Universe refresh interval | `PM_DATA_CAPTURE_UNIVERSE_REFRESH_INTERVAL_SECONDS` | `--capture-universe-refresh-interval-seconds` | `60.0` | Base refresh cadence. |
+| Max markets safety cap | `PM_DATA_CAPTURE_MAX_MARKETS` | `--capture-max-markets` | `2000` | Upper bound on active-binary universe. |
+| Data directory | `PM_DATA_DATA_DIR` | `--data-dir` | `./data` | Run bundle root. |
 
 ## 10. Capture operations playbook (Phase 1)
 Capture run (stop after ~10 minutes with Ctrl-C):
 ```bash
-uv run pm_arb capture --run-id run-10m
+uv run pm_data capture --run-id run-10m
 ```
 
 Post-run audit:
 ```bash
 RUN_DIR="data/runs/<run_id>"
-uv run pm_arb capture-verify --run-dir "$RUN_DIR" --summary-only
-uv run pm_arb capture-audit --run-dir "$RUN_DIR"
-uv run pm_arb capture-latency-report --run-dir "$RUN_DIR"
+uv run pm_data capture-verify --run-dir "$RUN_DIR" --summary-only
+uv run pm_data capture-audit --run-dir "$RUN_DIR"
+uv run pm_data capture-latency-report --run-dir "$RUN_DIR"
 ```
 
 ## 11. Data quality gates vs latency tuning (capture)

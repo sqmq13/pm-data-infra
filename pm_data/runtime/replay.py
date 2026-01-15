@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Iterable
 
-from pm_arb.capture_format import (
+from pm_data.capture_format import (
     frames_header_len,
     frames_header_struct,
     frames_magic,

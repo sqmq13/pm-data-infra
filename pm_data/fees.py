@@ -12,7 +12,7 @@ import requests
 # Polymarket Maker Rebates docs (fee-rate endpoint + fee table examples):
 # https://docs.polymarket.com/
 FEE_RATE_ENDPOINT = "/fee-rate"
-FEE_RATE_USER_AGENT = "pm-arb-py/phase1"
+FEE_RATE_USER_AGENT = "pm-data-infra/phase1"
 
 FEE_TABLE_PRECISION = Decimal("0.0001")
 PRICE_TABLE_PRECISION = Decimal("0.01")

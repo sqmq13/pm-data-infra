@@ -1,5 +1,5 @@
 [project]
-name = "pm-arb-py"
+name = "pm-data-infra"
 version = "0.1.0"
 description = "Phase 1 capture/ingest plant."
 readme = "README.md"
@@ -12,14 +12,14 @@ dependencies = [
 ]
 
 [project.scripts]
-pm_arb = "pm_arb.cli:main"
+pm_data = "pm_data.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-packages = ["pm_arb", "pm_arb.runtime", "pm_arb.strategies"]
+packages = ["pm_data", "pm_data.runtime", "pm_data.strategies"]
 
 [dependency-groups]
 dev = [

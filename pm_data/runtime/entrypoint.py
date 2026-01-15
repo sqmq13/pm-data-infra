@@ -9,12 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
-from pm_arb.config import Config
+from pm_data.config import Config
 
 from .allocator import Allocator
 from .execution_sim import FillEvent, SimExecutionBackend, SimExecutionConfig
 from .ledger import Ledger
-from .live import LiveDataSource
+from .live import LiveDataSource, load_live_tokens
 from .intents import CancelIntent, Intent, PlaceOrderIntent
 from .normalize import Normalizer
 from .orchestrator import Orchestrator
@@ -75,7 +75,7 @@ def _build_strategies(
     params = strategy_params or {}
     for name in strategy_names or []:
         if name == "toy_spread":
-            from pm_arb.strategies.toy_spread import ToySpreadStrategy
+            from pm_data.strategies.toy_spread import ToySpreadStrategy
 
             extra = params.get(name, {})
             strategies[name] = ToySpreadStrategy(**extra)
@@ -247,6 +247,7 @@ async def _run_live_sim_async(
     max_events: int | None,
     strategy_names: Sequence[str] | None,
     strategy_params: Mapping[str, Mapping[str, object]] | None,
+    token_ids: Sequence[str],
 ) -> RunSummary:
     start = time.perf_counter()
     strategies = _build_strategies(strategy_names, strategy_params)
@@ -260,7 +261,11 @@ async def _run_live_sim_async(
         strategy_params=strategy_params,
     )
     normalizer = Normalizer()
-    data_source = LiveDataSource(config=config, duration_seconds=duration_seconds)
+    data_source = LiveDataSource(
+        config=config,
+        duration_seconds=duration_seconds,
+        token_ids=list(token_ids),
+    )
     hasher = hashlib.sha256()
     canonical_events = 0
     intents = 0
@@ -309,6 +314,7 @@ def run_live_sim(
     strategy_names: Sequence[str] | None = None,
     strategy_params: Mapping[str, Mapping[str, object]] | None = None,
 ) -> RunSummary:
+    token_ids = load_live_tokens(config)
     return asyncio.run(
         _run_live_sim_async(
             config=config,
@@ -316,5 +322,6 @@ def run_live_sim(
             max_events=max_events,
             strategy_names=strategy_names,
             strategy_params=strategy_params,
+            token_ids=token_ids,
         )
     )

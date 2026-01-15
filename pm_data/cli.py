@@ -139,8 +139,31 @@ def _resolve_verify_targets(args: argparse.Namespace) -> list[tuple[Path, Path |
     raise ValueError("must provide --frames or --run-dir")
 
 
+def _validate_run_mode_args(args: argparse.Namespace) -> None:
+    incompatible: list[str] = []
+    if args.mode == "replay":
+        if args.duration_seconds is not None:
+            incompatible.append("--duration-seconds")
+        if args.print_summary_json:
+            incompatible.append("--print-summary-json")
+    else:
+        if args.run_dir is not None:
+            incompatible.append("--run-dir")
+        if args.max_seconds is not None:
+            incompatible.append("--max-seconds")
+        if args.print_pnl:
+            incompatible.append("--print-pnl")
+        if args.stable_json:
+            incompatible.append("--stable-json")
+    if incompatible:
+        if incompatible == ["--stable-json"]:
+            raise ValueError("--stable-json is only supported for replay mode")
+        flags = ", ".join(incompatible)
+        raise ValueError(f"{args.mode} mode does not support: {flags}")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="pm_arb")
+    parser = argparse.ArgumentParser(prog="pm_data")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -332,6 +355,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         stable_json = args.mode == "replay" and args.stable_json
         try:
+            _validate_run_mode_args(args)
             if args.mode == "replay":
                 if not args.print_hash:
                     raise ValueError("--print-hash is required for replay mode")
@@ -349,8 +373,6 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError("--print-summary-json is required for live mode")
                 if args.duration_seconds is None:
                     raise ValueError("--duration-seconds is required for live mode")
-                if args.stable_json:
-                    raise ValueError("--stable-json is only supported for replay mode")
                 summary = run_live_sim(
                     config=config,
                     duration_seconds=args.duration_seconds,

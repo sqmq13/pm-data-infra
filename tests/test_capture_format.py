@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pm_arb.capture_format import (
+from pm_data.capture_format import (
     FRAMES_HEADER_LEN,
     append_record,
     read_frames,

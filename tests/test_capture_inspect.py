@@ -1,9 +1,9 @@
 import json
 from pathlib import Path
 
-from pm_arb.capture_inspect import audit_heartbeat_gaps, inspect_run, write_latency_report
-from pm_arb.capture_offline import run_capture_offline
-from pm_arb.config import Config
+from pm_data.capture_inspect import audit_heartbeat_gaps, inspect_run, write_latency_report
+from pm_data.capture_offline import run_capture_offline
+from pm_data.config import Config
 
 
 def _repo_root() -> Path:

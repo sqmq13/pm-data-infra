@@ -1,4 +1,4 @@
-import pm_arb.cli as cli
+import pm_data.cli as cli
 
 
 def test_discover_active_binary(monkeypatch, capsys):

@@ -1,7 +1,7 @@
 from math import gcd
 
-from pm_arb.capture import monotonic_ns
-from pm_arb.capture_format import append_record
+from pm_data.capture import monotonic_ns
+from pm_data.capture_format import append_record
 
 
 def test_monotonic_ns_not_ms_quantized(tmp_path):

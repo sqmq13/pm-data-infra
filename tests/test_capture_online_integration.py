@@ -5,8 +5,8 @@ from collections import deque
 
 import pytest
 
-from pm_arb.capture import RunBootstrap, monotonic_ns
-from pm_arb.capture_online import (
+from pm_data.capture import RunBootstrap, monotonic_ns
+from pm_data.capture_online import (
     CaptureState,
     ShardState,
     UniverseState,
@@ -16,8 +16,8 @@ from pm_arb.capture_online import (
     _refresh_loop,
     _stable_hash,
 )
-from pm_arb.config import Config
-from pm_arb.gamma import UniverseSnapshot
+from pm_data.config import Config
+from pm_data.gamma import UniverseSnapshot
 
 
 async def _wait_for_runlog_record(run_dir, record_type, timeout_seconds=1.0):
@@ -105,8 +105,8 @@ async def test_refresh_integration_changed_shard_and_grace(tmp_path, monkeypatch
             selection={"max_markets": 1},
         )
 
-    monkeypatch.setattr("pm_arb.capture_online.compute_desired_universe", fake_compute)
-    monkeypatch.setattr("pm_arb.capture_online.fetch_markets", lambda *args, **kwargs: [])
+    monkeypatch.setattr("pm_data.capture_online.compute_desired_universe", fake_compute)
+    monkeypatch.setattr("pm_data.capture_online.fetch_markets", lambda *args, **kwargs: [])
 
     refresh_task = asyncio.create_task(_refresh_loop(state))
     await _wait_for_runlog_record(run_dir, "universe_refresh")

@@ -1,2 +1,2 @@
 [console_scripts]
-pm_arb = pm_arb.cli:main
+pm_data = pm_data.cli:main

@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from pm_arb.fees import FeeRateClient
+from pm_data.fees import FeeRateClient
 
 
 class FakeClock:

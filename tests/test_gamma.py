@@ -1,5 +1,5 @@
-from pm_arb import gamma
-from pm_arb.config import Config
+from pm_data import gamma
+from pm_data.config import Config
 
 
 def test_parse_clob_token_ids_variants():

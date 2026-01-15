@@ -6,11 +6,11 @@ from typing import Any
 
 import pytest
 
-from pm_arb.capture import RunBootstrap
-from pm_arb.capture import monotonic_ns
-from pm_arb.capture_format import FrameRecord
-import pm_arb.capture_online as capture_online
-from pm_arb.capture_online import (
+from pm_data.capture import RunBootstrap
+from pm_data.capture import monotonic_ns
+from pm_data.capture_format import FrameRecord
+import pm_data.capture_online as capture_online
+from pm_data.capture_online import (
     CaptureState,
     ShardState,
     UniverseState,
@@ -20,8 +20,8 @@ from pm_arb.capture_online import (
     _heartbeat_loop,
     _mark_reconnecting,
 )
-from pm_arb.config import Config
-from pm_arb.ws_primitives import is_confirm_payload
+from pm_data.config import Config
+from pm_data.ws_primitives import is_confirm_payload
 
 
 class FakeWebSocket:
@@ -438,7 +438,7 @@ async def test_backpressure_fatal_emits_missing_tokens(tmp_path, monkeypatch):
             payload=args[2],
         )
 
-    monkeypatch.setattr("pm_arb.capture_online.append_record", slow_append_record)
+    monkeypatch.setattr("pm_data.capture_online.append_record", slow_append_record)
 
     for _ in range(5):
         rx_mono_ns = monotonic_ns() - 1_000_000_000
@@ -502,8 +502,8 @@ async def test_heartbeat_does_not_fatal_on_expired_confirm_deadline(tmp_path, mo
     def fail_trigger(*args, **kwargs):
         raise AssertionError("unexpected fatal trigger")
 
-    monkeypatch.setattr("pm_arb.capture_online._write_metrics", fake_write_metrics)
-    monkeypatch.setattr("pm_arb.capture_online._trigger_fatal", fail_trigger)
+    monkeypatch.setattr("pm_data.capture_online._write_metrics", fake_write_metrics)
+    monkeypatch.setattr("pm_data.capture_online._trigger_fatal", fail_trigger)
 
     await _heartbeat_loop(state)
 

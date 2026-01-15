@@ -1,6 +1,6 @@
-from pm_arb.capture_online import _load_pinned_markets
-from pm_arb.config import Config
-from pm_arb.gamma import select_active_binary_markets
+from pm_data.capture_online import _load_pinned_markets
+from pm_data.config import Config
+from pm_data.gamma import select_active_binary_markets
 
 
 def test_select_active_binary_markets_filters_and_orders():
@@ -59,7 +59,7 @@ def test_capture_pins_active_binary_by_default(monkeypatch):
         },
     ]
     monkeypatch.setattr(
-        "pm_arb.capture_online.fetch_markets", lambda *args, **kwargs: markets
+        "pm_data.capture_online.fetch_markets", lambda *args, **kwargs: markets
     )
     config = Config(capture_max_markets=10)
     selected, tokens, universe_mode, market_regex_effective, _ = _load_pinned_markets(

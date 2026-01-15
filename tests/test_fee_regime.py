@@ -2,11 +2,11 @@ from collections import deque
 
 import pytest
 
-from pm_arb.capture import RunBootstrap
-from pm_arb.capture_online import CaptureState, ShardState, UniverseState, _heartbeat_loop
-from pm_arb.config import Config
-from pm_arb.fees import FeeRegimeMonitor
-from pm_arb.segments import SegmentTag
+from pm_data.capture import RunBootstrap
+from pm_data.capture_online import CaptureState, ShardState, UniverseState, _heartbeat_loop
+from pm_data.config import Config
+from pm_data.fees import FeeRegimeMonitor
+from pm_data.segments import SegmentTag
 
 
 def _segment(cadence_bucket: str, is_crypto: bool | None, fee_rate_bps: int) -> SegmentTag:
@@ -134,7 +134,7 @@ async def test_fee_regime_trip_surfaces_in_metrics(tmp_path, monkeypatch):
             captured["record"] = record
             state.fatal_event.set()
 
-    monkeypatch.setattr("pm_arb.capture_online._write_metrics", fake_write_metrics)
+    monkeypatch.setattr("pm_data.capture_online._write_metrics", fake_write_metrics)
     await _heartbeat_loop(state)
 
     record = captured["record"]

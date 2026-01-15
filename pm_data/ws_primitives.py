@@ -54,19 +54,31 @@ def split_subscribe_groups(
     max_bytes: int,
     variant: str,
 ) -> list[list[str]]:
+    empty_payload_len = len(orjson.dumps(build_subscribe_payload(variant, [])))
+    # Track JSON payload size incrementally: base wrapper + token JSON lengths + commas.
     groups: list[list[str]] = []
     current: list[str] = []
+    current_count = 0
+    current_len = empty_payload_len
     for token_id in token_ids:
-        candidate = current + [token_id]
-        payload = build_subscribe_payload(variant, candidate)
-        payload_bytes = orjson.dumps(payload)
-        if len(candidate) > max_tokens or len(payload_bytes) > max_bytes:
-            if not current:
+        token_len = len(orjson.dumps(token_id))
+        extra_comma = 1 if current_count > 0 else 0
+        candidate_count = current_count + 1
+        candidate_len = current_len + token_len + extra_comma
+        if candidate_count > max_tokens or candidate_len > max_bytes:
+            if current_count == 0:
                 raise ValueError("single subscribe payload exceeds limits")
             groups.append(current)
-            current = [token_id]
-        else:
-            current = candidate
+            current = []
+            current_count = 0
+            current_len = empty_payload_len
+            candidate_count = 1
+            candidate_len = current_len + token_len
+            if candidate_count > max_tokens or candidate_len > max_bytes:
+                raise ValueError("single subscribe payload exceeds limits")
+        current.append(token_id)
+        current_count = candidate_count
+        current_len = candidate_len
     if current:
         groups.append(current)
     return groups

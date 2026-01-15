@@ -1,8 +1,8 @@
 import math
 from pathlib import Path
 
-from pm_arb.capture_offline import quantile, run_capture_offline
-from pm_arb.config import Config
+from pm_data.capture_offline import quantile, run_capture_offline
+from pm_data.config import Config
 
 
 def _repo_root() -> Path:

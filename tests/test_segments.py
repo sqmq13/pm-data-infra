@@ -1,4 +1,4 @@
-from pm_arb.segments import (
+from pm_data.segments import (
     build_segment_maps,
     extract_expiry_times,
     infer_cadence_bucket,
