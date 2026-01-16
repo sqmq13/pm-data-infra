@@ -31,54 +31,34 @@ def to_e6(value: str | float | int | None) -> int | None:
                     pos = 1
                 elif text[0] == "+":
                     pos = 1
-                if pos >= len(text):
+                core = text[pos:]
+                if not core:
                     raw = Decimal(text)
                     scaled_dec = raw * _E6
                     quantized = scaled_dec.to_integral_value(rounding=ROUND_HALF_UP)
                     return int(quantized)
-
-                whole_val = 0
-                frac_val = 0
-                frac_digits = 0
-                round_digit = -1
-                saw_dot = False
-                saw_digit = False
-                for char in text[pos:]:
-                    if "0" <= char <= "9":
-                        saw_digit = True
-                        digit = ord(char) - 48
-                        if not saw_dot:
-                            whole_val = whole_val * 10 + digit
-                            continue
-                        if frac_digits < 6:
-                            frac_val = frac_val * 10 + digit
-                            frac_digits += 1
-                            continue
-                        if frac_digits == 6:
-                            round_digit = digit
-                            frac_digits += 1
-                            continue
-                        frac_digits += 1
-                        continue
-                    if char == "." and not saw_dot:
-                        saw_dot = True
-                        continue
+                dot = core.find(".")
+                if dot == -1:
+                    if core.isdigit():
+                        return sign * int(core) * 1_000_000
                     raw = Decimal(text)
                     scaled_dec = raw * _E6
                     quantized = scaled_dec.to_integral_value(rounding=ROUND_HALF_UP)
                     return int(quantized)
-                if not saw_digit:
-                    raw = Decimal(text)
-                    scaled_dec = raw * _E6
-                    quantized = scaled_dec.to_integral_value(rounding=ROUND_HALF_UP)
-                    return int(quantized)
-                while frac_digits < 6:
-                    frac_val *= 10
-                    frac_digits += 1
-                scaled = whole_val * 1_000_000 + frac_val
-                if round_digit >= 5:
-                    scaled += 1
-                return sign * scaled
+                whole_text = core[:dot] or "0"
+                frac_text = core[dot + 1 :]
+                if whole_text.isdigit() and (frac_text == "" or frac_text.isdigit()):
+                    whole_val = int(whole_text) if whole_text else 0
+                    frac_pad = (frac_text + "0000000") if frac_text else "0000000"
+                    frac_val = int(frac_pad[:6])
+                    scaled = whole_val * 1_000_000 + frac_val
+                    if len(frac_text) >= 7 and (ord(frac_pad[6]) - 48) >= 5:
+                        scaled += 1
+                    return sign * scaled
+                raw = Decimal(text)
+                scaled_dec = raw * _E6
+                quantized = scaled_dec.to_integral_value(rounding=ROUND_HALF_UP)
+                return int(quantized)
         raw = Decimal(text)
     elif isinstance(value, float):
         raw = Decimal(str(value))
@@ -266,16 +246,28 @@ def _best_ask(levels: list, *, stats: "Normalizer | None" = None) -> tuple[int |
 class Normalizer:
     decode_errors: int = 0
     schema_errors: int = 0
+    schema_error_bids_type: int = 0
+    schema_error_asks_type: int = 0
+    schema_error_item_exception: int = 0
     bid_scan_count: int = 0
     bid_scan_levels_total: int = 0
     bid_scan_levels_max: int = 0
     ask_scan_count: int = 0
     ask_scan_levels_total: int = 0
     ask_scan_levels_max: int = 0
+    payload_items_total: int = 0
+    payload_items_max: int = 0
+    payload_frames_with_items: int = 0
+    payload_frames_multi_item: int = 0
+    prefilter_skipped_frames: int = 0
 
     def iter_normalize(self, frame: RawFrame) -> Iterator[TopOfBookUpdate]:
         payload_bytes = frame.payload
         if payload_bytes in (b"PONG", b"PING"):
+            return
+            yield  # pragma: no cover
+        if b'"bids"' not in payload_bytes and b'"asks"' not in payload_bytes:
+            self.prefilter_skipped_frames += 1
             return
             yield  # pragma: no cover
         try:
@@ -285,7 +277,9 @@ class Normalizer:
             return
             yield  # pragma: no cover
 
+        items_in_frame = 0
         for item in _iter_items(payload):
+            items_in_frame += 1
             try:
                 if "bids" not in item and "asks" not in item:
                     continue
@@ -300,10 +294,12 @@ class Normalizer:
                     bids = bids_raw
                 elif bids_raw is not None:
                     self.schema_errors += 1
+                    self.schema_error_bids_type += 1
                 if isinstance(asks_raw, list):
                     asks = asks_raw
                 elif asks_raw is not None:
                     self.schema_errors += 1
+                    self.schema_error_asks_type += 1
                 bid_px_e6, bid_sz_e6 = _best_bid(bids, stats=self)
                 ask_px_e6, ask_sz_e6 = _best_ask(asks, stats=self)
                 if bid_px_e6 is None and ask_px_e6 is None:
@@ -321,18 +317,31 @@ class Normalizer:
                 )
             except Exception:
                 self.schema_errors += 1
+                self.schema_error_item_exception += 1
                 continue
+        if items_in_frame > 0:
+            self.payload_frames_with_items += 1
+            self.payload_items_total += items_in_frame
+            if items_in_frame > self.payload_items_max:
+                self.payload_items_max = items_in_frame
+            if items_in_frame > 1:
+                self.payload_frames_multi_item += 1
 
     def iter_normalize_timed(
         self,
         frame: RawFrame,
         *,
         clock_ns=time.perf_counter_ns,
-    ) -> Iterator[tuple[TopOfBookUpdate, int, int]]:
+    ) -> Iterator[tuple[TopOfBookUpdate, int, int, int]]:
         payload_bytes = frame.payload
         if payload_bytes in (b"PONG", b"PING"):
             return
             yield  # pragma: no cover
+        if b'"bids"' not in payload_bytes and b'"asks"' not in payload_bytes:
+            self.prefilter_skipped_frames += 1
+            return
+            yield  # pragma: no cover
+        decode_start_ns = int(clock_ns())
         try:
             payload = orjson.loads(payload_bytes)
         except orjson.JSONDecodeError:
@@ -341,7 +350,9 @@ class Normalizer:
             yield  # pragma: no cover
         decode_end_ns = int(clock_ns())
 
+        items_in_frame = 0
         for item in _iter_items(payload):
+            items_in_frame += 1
             try:
                 if "bids" not in item and "asks" not in item:
                     continue
@@ -356,10 +367,12 @@ class Normalizer:
                     bids = bids_raw
                 elif bids_raw is not None:
                     self.schema_errors += 1
+                    self.schema_error_bids_type += 1
                 if isinstance(asks_raw, list):
                     asks = asks_raw
                 elif asks_raw is not None:
                     self.schema_errors += 1
+                    self.schema_error_asks_type += 1
                 bid_px_e6, bid_sz_e6 = _best_bid(bids, stats=self)
                 ask_px_e6, ask_sz_e6 = _best_ask(asks, stats=self)
                 if bid_px_e6 is None and ask_px_e6 is None:
@@ -376,10 +389,18 @@ class Normalizer:
                     seq=0,
                 )
                 normalize_end_ns = int(clock_ns())
-                yield event, decode_end_ns, normalize_end_ns
+                yield event, decode_start_ns, decode_end_ns, normalize_end_ns
             except Exception:
                 self.schema_errors += 1
+                self.schema_error_item_exception += 1
                 continue
+        if items_in_frame > 0:
+            self.payload_frames_with_items += 1
+            self.payload_items_total += items_in_frame
+            if items_in_frame > self.payload_items_max:
+                self.payload_items_max = items_in_frame
+            if items_in_frame > 1:
+                self.payload_frames_multi_item += 1
 
     def normalize_timed(
         self,
@@ -390,7 +411,7 @@ class Normalizer:
         events: list[TopOfBookUpdate] = []
         decode_end_ns = 0
         normalize_end_ns = 0
-        for event, decode_end_ns, normalize_end_ns in self.iter_normalize_timed(
+        for event, _decode_start_ns, decode_end_ns, normalize_end_ns in self.iter_normalize_timed(
             frame, clock_ns=clock_ns
         ):
             events.append(event)

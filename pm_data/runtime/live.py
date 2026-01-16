@@ -60,6 +60,17 @@ def _assign_shards_by_token(token_ids: list[str], shard_count: int) -> dict[int,
 
 
 def load_live_tokens(config: Config) -> list[str]:
+    return load_live_universe_stats(config).token_ids
+
+
+@dataclass(slots=True)
+class LiveUniverseStats:
+    token_ids: list[str]
+    fetched_markets: int
+    selected_markets: int
+
+
+def load_live_universe_stats(config: Config) -> LiveUniverseStats:
     markets = fetch_markets(
         config.gamma_base_url,
         config.rest_timeout,
@@ -78,7 +89,11 @@ def load_live_tokens(config: Config) -> list[str]:
             continue
         for token_id in token_ids:
             tokens.add(str(token_id))
-    return sorted(tokens)
+    return LiveUniverseStats(
+        token_ids=sorted(tokens),
+        fetched_markets=len(markets),
+        selected_markets=len(selected),
+    )
 
 
 class _ConfirmTimeout(TimeoutError):

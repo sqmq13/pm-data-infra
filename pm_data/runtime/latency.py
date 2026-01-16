@@ -103,6 +103,8 @@ class LiveLatencyCollector:
     stages: dict[str, LatencyHistogram] = field(
         default_factory=lambda: {
             "recv_to_decode": LatencyHistogram(),
+            "recv_to_decode_start": LatencyHistogram(),
+            "decode_start_to_decode_end": LatencyHistogram(),
             "decode_to_normalize": LatencyHistogram(),
             "normalize_to_state": LatencyHistogram(),
             "state_to_strategy": LatencyHistogram(),
@@ -122,10 +124,15 @@ class LiveLatencyCollector:
         self.end_mono_ns = int(mono_ns)
         self.end_cpu_ns = int(time.process_time_ns())
 
+    def snapshot(self, mono_ns: int) -> None:
+        self.end_mono_ns = int(mono_ns)
+        self.end_cpu_ns = int(time.process_time_ns())
+
     def observe_event(
         self,
         *,
         recv_ns: int,
+        decode_start_ns: int,
         decode_end_ns: int,
         normalize_end_ns: int,
         state_end_ns: int,
@@ -140,6 +147,11 @@ class LiveLatencyCollector:
             return int(delta_ns // 1_000)
 
         self.canonical_events += 1
+        if decode_start_ns > 0:
+            self.stages["recv_to_decode_start"].observe_us(_us(decode_start_ns - recv_ns))
+            self.stages["decode_start_to_decode_end"].observe_us(
+                _us(decode_end_ns - decode_start_ns)
+            )
         self.stages["recv_to_decode"].observe_us(_us(decode_end_ns - recv_ns))
         self.stages["decode_to_normalize"].observe_us(
             _us(normalize_end_ns - decode_end_ns)

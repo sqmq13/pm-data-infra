@@ -5,16 +5,16 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from pm_data.config import Config
 
 from .allocator import Allocator
 from .execution_sim import FillEvent, SimExecutionBackend, SimExecutionConfig
 from .ledger import Ledger
-from .live import LiveDataSource, load_live_tokens
+from .live import LiveDataSource, load_live_universe_stats
 from .intents import CancelIntent, Intent, PlaceOrderIntent
 from .normalize import Normalizer
 from .orchestrator import Orchestrator
@@ -23,6 +23,7 @@ from .state import GlobalState
 from .replay import ReplayDataSource
 from .strategy import Strategy
 from .latency import LiveLatencyCollector
+from .health import LiveUniverseSummary, build_live_health_summary
 
 
 @dataclass(slots=True)
@@ -86,6 +87,13 @@ def format_run_summary(summary: RunSummary, *, stable: bool) -> str:
 
 
 def format_latency_report(report: Mapping[str, object], *, stable: bool) -> str:
+    payload: object = report
+    if stable:
+        payload = _canonicalize_stable_json(dict(report))
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def format_health_summary(report: Mapping[str, object], *, stable: bool) -> str:
     payload: object = report
     if stable:
         payload = _canonicalize_stable_json(dict(report))
@@ -272,10 +280,17 @@ async def _run_live_sim_async(
     max_events: int | None,
     strategy_names: Sequence[str] | None,
     strategy_params: Mapping[str, Mapping[str, object]] | None,
-    token_ids: Sequence[str],
+    universe_tokens: Sequence[str],
+    universe_selected_markets: int | None,
+    universe_fetched_markets: int | None,
     latency_report: bool,
-) -> tuple[RunSummary, dict[str, object] | None]:
+    health_summary: bool,
+    health_heartbeat: bool,
+    health_interval_seconds: float | None,
+    health_emit_hook: Callable[[str], None] | None,
+) -> tuple[RunSummary, dict[str, object] | None, dict[str, object] | None]:
     start = time.perf_counter()
+    subscribed_tokens = len(universe_tokens)
     strategies = _build_strategies(strategy_names, strategy_params)
     state = GlobalState()
     execution = SimExecutionBackend(state=state, config=SimExecutionConfig())
@@ -290,29 +305,76 @@ async def _run_live_sim_async(
     data_source = LiveDataSource(
         config=config,
         duration_seconds=duration_seconds,
-        token_ids=list(token_ids),
+        token_ids=list(universe_tokens),
     )
     hasher = hashlib.sha256()
     canonical_events = 0
     intents = 0
     submitted_intents = 0
     stop = False
-    collector: LiveLatencyCollector | None = LiveLatencyCollector() if latency_report else None
+    enable_latency = bool(latency_report or health_summary or health_heartbeat)
+    collector: LiveLatencyCollector | None = LiveLatencyCollector() if enable_latency else None
     if collector is not None:
         collector.start(time.perf_counter_ns())
+    next_health_ns = 0
+    health_interval_ns = 0
+    if health_heartbeat and health_interval_seconds is not None and health_interval_seconds > 0:
+        health_interval_ns = int(health_interval_seconds * 1_000_000_000)
+        next_health_ns = int(collector.start_mono_ns + health_interval_ns) if collector else 0
 
     async for frame in data_source.stream():
+        if (
+            health_heartbeat
+            and collector is not None
+            and health_emit_hook is not None
+            and next_health_ns > 0
+            and frame.rx_mono_ns >= next_health_ns
+        ):
+            collector.snapshot(frame.rx_mono_ns)
+            health = dict(
+                build_live_health_summary(
+                    collector=collector,
+                    universe=LiveUniverseSummary(
+                        subscribed_tokens=subscribed_tokens,
+                        selected_markets=universe_selected_markets,
+                        fetched_markets=universe_fetched_markets,
+                    ),
+                    ws_shards=config.ws_shards,
+                    capture_max_markets=config.capture_max_markets,
+                    reconnects=data_source.stats.reconnects,
+                    dropped=data_source.stats.dropped.total,
+                    decode_errors=normalizer.decode_errors,
+                    schema_errors=normalizer.schema_errors,
+                    schema_error_bids_type=normalizer.schema_error_bids_type,
+                    schema_error_asks_type=normalizer.schema_error_asks_type,
+                    schema_error_item_exception=normalizer.schema_error_item_exception,
+                    payload_items_total=normalizer.payload_items_total,
+                    payload_items_max=normalizer.payload_items_max,
+                    payload_frames_with_items=normalizer.payload_frames_with_items,
+                    payload_frames_multi_item=normalizer.payload_frames_multi_item,
+                    prefilter_skipped_frames=normalizer.prefilter_skipped_frames,
+                    stable=False,
+                )
+            )
+            health["record_type"] = "live_health_heartbeat"
+            health_emit_hook(format_health_summary(health, stable=False))
+            while next_health_ns > 0 and frame.rx_mono_ns >= next_health_ns:
+                next_health_ns += health_interval_ns
         if collector is not None:
             collector.frames += 1
             recv_ns = frame.rx_mono_ns
-            for event, decode_end_ns, normalize_end_ns in normalizer.iter_normalize_timed(
-                frame
-            ):
+            for (
+                event,
+                decode_start_ns,
+                decode_end_ns,
+                normalize_end_ns,
+            ) in normalizer.iter_normalize_timed(frame):
                 trace = EventLatencyTrace()
                 canonical_events += 1
                 merged, _exec_events = orchestrator.process_event(event, trace=trace)
                 collector.observe_event(
                     recv_ns=recv_ns,
+                    decode_start_ns=decode_start_ns,
                     decode_end_ns=decode_end_ns,
                     normalize_end_ns=normalize_end_ns,
                     state_end_ns=trace.state_end_ns,
@@ -363,6 +425,7 @@ async def _run_live_sim_async(
         submitted_intents=submitted_intents,
     )
     report: dict[str, object] | None = None
+    health: dict[str, object] | None = None
     if collector is not None:
         collector.finish(time.perf_counter_ns())
         report = collector.report(
@@ -377,7 +440,33 @@ async def _run_live_sim_async(
             ask_scan_levels_total=normalizer.ask_scan_levels_total,
             ask_scan_levels_max=normalizer.ask_scan_levels_max,
         )
-    return summary, report
+        if health_summary:
+            health = dict(
+                build_live_health_summary(
+                    collector=collector,
+                    universe=LiveUniverseSummary(
+                        subscribed_tokens=subscribed_tokens,
+                        selected_markets=universe_selected_markets,
+                        fetched_markets=universe_fetched_markets,
+                    ),
+                    ws_shards=config.ws_shards,
+                    capture_max_markets=config.capture_max_markets,
+                    reconnects=data_source.stats.reconnects,
+                    dropped=data_source.stats.dropped.total,
+                    decode_errors=normalizer.decode_errors,
+                    schema_errors=normalizer.schema_errors,
+                    schema_error_bids_type=normalizer.schema_error_bids_type,
+                    schema_error_asks_type=normalizer.schema_error_asks_type,
+                    schema_error_item_exception=normalizer.schema_error_item_exception,
+                    payload_items_total=normalizer.payload_items_total,
+                    payload_items_max=normalizer.payload_items_max,
+                    payload_frames_with_items=normalizer.payload_frames_with_items,
+                    payload_frames_multi_item=normalizer.payload_frames_multi_item,
+                    prefilter_skipped_frames=normalizer.prefilter_skipped_frames,
+                    stable=False,
+                )
+            )
+    return summary, report, health
 
 
 def run_live_sim(
@@ -388,8 +477,19 @@ def run_live_sim(
     strategy_names: Sequence[str] | None = None,
     strategy_params: Mapping[str, Mapping[str, object]] | None = None,
     latency_report: bool = False,
-) -> tuple[RunSummary, dict[str, object] | None]:
-    token_ids = load_live_tokens(config)
+    health_summary: bool = False,
+    health_heartbeat: bool = False,
+    health_interval_seconds: float | None = None,
+    health_emit_hook: Callable[[str], None] | None = None,
+) -> tuple[RunSummary, dict[str, object] | None, dict[str, object] | None]:
+    universe = load_live_universe_stats(config)
+    effective_ws_shards = _effective_live_ws_shards(
+        ws_shards=config.ws_shards,
+        runtime_auto=config.runtime_auto_ws_shards_enable,
+        token_count=len(universe.token_ids),
+    )
+    if effective_ws_shards != config.ws_shards:
+        config = replace(config, ws_shards=effective_ws_shards)
     from pm_data.windows_timer import windows_high_res_timer
 
     with windows_high_res_timer(enable=config.runtime_windows_high_res_timer_enable):
@@ -400,7 +500,21 @@ def run_live_sim(
                 max_events=max_events,
                 strategy_names=strategy_names,
                 strategy_params=strategy_params,
-                token_ids=token_ids,
+                universe_tokens=universe.token_ids,
+                universe_selected_markets=universe.selected_markets,
+                universe_fetched_markets=universe.fetched_markets,
                 latency_report=latency_report,
+                health_summary=health_summary,
+                health_heartbeat=health_heartbeat,
+                health_interval_seconds=health_interval_seconds,
+                health_emit_hook=health_emit_hook,
             )
         )
+
+
+def _effective_live_ws_shards(*, ws_shards: int, runtime_auto: bool, token_count: int) -> int:
+    if not runtime_auto:
+        return ws_shards
+    if ws_shards == 8 and token_count >= 5000:
+        return 4
+    return ws_shards

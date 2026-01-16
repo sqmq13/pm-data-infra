@@ -26,6 +26,20 @@ def _parse_number(value: str, target_type: type) -> Any:
 
 
 def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
+    if isinstance(field_type, str):
+        text = field_type.strip()
+        parts = [part.strip() for part in text.split("|")]
+        if len(parts) == 2 and "None" in parts:
+            other = parts[0] if parts[1] == "None" else parts[1]
+            if other == "int":
+                return int, True
+            if other == "float":
+                return float, True
+            if other == "bool":
+                return bool, True
+            if other == "str":
+                return str, True
+            return other, True
     origin = get_origin(field_type)
     union_type = getattr(types, "UnionType", None)
     if origin not in (typing.Union, union_type):
@@ -125,6 +139,7 @@ class Config:
     min_free_disk_gb: int | None = 5
     offline: bool = False
     runtime_windows_high_res_timer_enable: bool = True
+    runtime_auto_ws_shards_enable: bool = True
 
     def apply_overrides(self, overrides: dict[str, Any]) -> "Config":
         for field in fields(self):

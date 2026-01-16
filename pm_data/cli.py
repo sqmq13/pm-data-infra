@@ -33,6 +33,7 @@ from .capture_slice import slice_run
 from .gamma import fetch_markets, select_active_binary_markets
 from .runtime.entrypoint import (
     RunSummary,
+    format_health_summary,
     format_latency_report,
     format_run_summary,
     run_live_sim,
@@ -41,6 +42,20 @@ from .runtime.entrypoint import (
 
 
 def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
+    if isinstance(field_type, str):
+        text = field_type.strip()
+        parts = [part.strip() for part in text.split("|")]
+        if len(parts) == 2 and "None" in parts:
+            base = parts[0] if parts[1] == "None" else parts[1]
+            if base == "int":
+                return int, True
+            if base == "float":
+                return float, True
+            if base == "bool":
+                return bool, True
+            if base == "str":
+                return str, True
+            return base, True
     origin = typing.get_origin(field_type)
     union_type = getattr(types, "UnionType", None)
     if origin not in (typing.Union, union_type):
@@ -158,6 +173,14 @@ def _validate_run_mode_args(args: argparse.Namespace) -> None:
             incompatible.append("--duration-seconds")
         if args.print_summary_json:
             incompatible.append("--print-summary-json")
+        if args.print_latency_report_json:
+            incompatible.append("--print-latency-report-json")
+        if args.print_health_summary_json:
+            incompatible.append("--print-health-summary-json")
+        if args.print_health_heartbeat_json:
+            incompatible.append("--print-health-heartbeat-json")
+        if args.health_interval_seconds is not None:
+            incompatible.append("--health-interval-seconds")
     else:
         if args.run_dir is not None:
             incompatible.append("--run-dir")
@@ -237,6 +260,9 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--print-pnl", action="store_true", default=False)
     run.add_argument("--print-summary-json", action="store_true", default=False)
     run.add_argument("--print-latency-report-json", action="store_true", default=False)
+    run.add_argument("--print-health-summary-json", action="store_true", default=False)
+    run.add_argument("--print-health-heartbeat-json", action="store_true", default=False)
+    run.add_argument("--health-interval-seconds", type=float, default=None)
     run.add_argument("--stable-json", action="store_true", default=False)
 
     args = parser.parse_args(argv)
@@ -445,10 +471,6 @@ def main(argv: list[str] | None = None) -> int:
         try:
             _validate_run_mode_args(args)
             if args.mode == "replay":
-                if args.print_latency_report_json:
-                    raise ValueError(
-                        "--print-latency-report-json is only supported for live mode"
-                    )
                 if not args.print_hash:
                     raise ValueError("--print-hash is required for replay mode")
                 if not args.run_dir:
@@ -463,15 +485,25 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 if args.duration_seconds is None:
                     raise ValueError("--duration-seconds is required for live mode")
-                summary, latency_report = run_live_sim(
+                want_health = args.print_health_summary_json or args.print_health_heartbeat_json
+                heartbeat_interval = args.health_interval_seconds
+                if args.print_health_heartbeat_json and heartbeat_interval is None:
+                    heartbeat_interval = 10.0
+                summary, latency_report, health_summary = run_live_sim(
                     config=config,
                     duration_seconds=args.duration_seconds,
                     max_events=args.max_events,
                     strategy_names=args.strategy,
                     latency_report=args.print_latency_report_json,
+                    health_summary=want_health,
+                    health_heartbeat=args.print_health_heartbeat_json,
+                    health_interval_seconds=heartbeat_interval,
+                    health_emit_hook=print if args.print_health_heartbeat_json else None,
                 )
                 if args.print_latency_report_json and latency_report is not None:
                     print(format_latency_report(latency_report, stable=False))
+                if args.print_health_summary_json and health_summary is not None:
+                    print(format_health_summary(health_summary, stable=False))
             if args.mode == "replay" or args.print_summary_json:
                 print(format_run_summary(summary, stable=stable_json))
             return 0 if summary.ok else 1

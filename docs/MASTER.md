@@ -89,10 +89,26 @@ Live sim latency report (prints summary JSON + aggregated stage histograms):
 uv run pm_data run --mode live --execution sim --duration-seconds 600 --print-summary-json --print-latency-report-json --strategy toy_spread
 ```
 
+Live sim health summary (prints end-of-run health JSON record):
+```bash
+uv run pm_data run --mode live --execution sim --duration-seconds 600 --print-health-summary-json --strategy toy_spread
+```
+
+Live sim health heartbeats (prints rolling health JSON records during the run):
+```bash
+uv run pm_data run --mode live --execution sim --duration-seconds 600 --print-health-heartbeat-json --health-interval-seconds 10 --strategy toy_spread
+```
+
 Notes:
 - Replay and live runtime do not write to `data/runs/*`.
 - `--max-events` caps canonical events (not raw frames).
 - Strategies are enabled explicitly via `--strategy`.
+
+LIVE health / latency definitions:
+- Timing uses `time.perf_counter_ns` only (monotonic; host-specific).
+- `e2e_total`: `rx_mono_ns` at WS receive → end of sim execution (stdout printing excluded unless enabled separately).
+- Stages: `recv_to_decode`, `decode_to_normalize`, `normalize_to_state`, `state_to_strategy`, `strategy_to_allocator`, `allocator_to_execution`, `execution_to_emit`.
+- Optional attribution split stages: `recv_to_decode_start` (queue wait proxy) and `decode_start_to_decode_end` (decode CPU).
 
 ## 7. Determinism audit snippet (macOS + Ubuntu)
 ```bash
@@ -135,6 +151,7 @@ Key settings and defaults:
 | Coverage metrics interval | `PM_DATA_CAPTURE_COVERAGE_METRICS_INTERVAL_SECONDS` | `--capture-coverage-metrics-interval-seconds` | `5.0` | Throttles expensive coverage_pct calculations. |
 | Windows high-res timer | `PM_DATA_CAPTURE_WINDOWS_HIGH_RES_TIMER_ENABLE` | `--capture-windows-high-res-timer-enable` | `true` | On Windows only: calls `timeBeginPeriod(1)` to reduce loop lag jitter. |
 | Runtime Windows high-res timer | `PM_DATA_RUNTIME_WINDOWS_HIGH_RES_TIMER_ENABLE` | `--runtime-windows-high-res-timer-enable` | `true` | On Windows only: wraps the live runtime event loop with `timeBeginPeriod(1)`. |
+| Runtime auto ws_shards | `PM_DATA_RUNTIME_AUTO_WS_SHARDS_ENABLE` | `--runtime-auto-ws-shards-enable` | `true` | Live runtime only: adjusts `ws_shards` for tail latency (currently: if `ws_shards==8` and token_count >= 5000, uses `4`). |
 | Data directory | `PM_DATA_DATA_DIR` | `--data-dir` | `./data` | Run bundle root. |
 
 ## 10. Capture operations playbook (Phase 1)

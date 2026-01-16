@@ -40,6 +40,17 @@ def test_normalizer_uses_last_level_for_sorted_bid_ask_lists() -> None:
     assert normalizer.ask_scan_count == 0
 
 
+def test_normalizer_large_sorted_lists_avoid_scans() -> None:
+    bids = [{"price": f"0.{i:02d}", "size": "1"} for i in range(1, 80)]
+    asks = [{"price": f"0.{i:02d}", "size": "1"} for i in range(99, 20, -1)]
+    payload = {"asset_id": "tokenA", "bids": bids, "asks": asks}
+    normalizer = Normalizer()
+    events = normalizer.normalize(_frame(payload))
+    assert len(events) == 1
+    assert normalizer.bid_scan_count == 0
+    assert normalizer.ask_scan_count == 0
+
+
 def test_normalizer_falls_back_to_scan_when_bids_not_monotonic() -> None:
     payload = {
         "event_type": "book",
@@ -82,4 +93,3 @@ def test_normalizer_falls_back_to_scan_when_asks_not_monotonic() -> None:
     assert len(events) == 1
     assert events[0].ask_px_e6 == 100_000
     assert normalizer.ask_scan_count > 0
-
