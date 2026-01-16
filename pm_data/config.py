@@ -81,11 +81,14 @@ class Config:
     capture_confirm_max_failures: int = 3
     capture_backpressure_fatal_ms: float = 250.0
     capture_ring_buffer_frames: int = 4096
-    capture_metrics_max_samples: int = 5000
+    capture_metrics_max_samples: int = 1024
     capture_runlog_enqueue_timeout_seconds: float = 1.0
     capture_ndjson_fsync_on_close: bool = False
     capture_ndjson_fsync_interval_seconds: float | None = None
     capture_heartbeat_interval_seconds: float = 1.0
+    capture_disk_usage_interval_seconds: float = 10.0
+    capture_coverage_metrics_interval_seconds: float = 5.0
+    capture_windows_high_res_timer_enable: bool = True
     capture_gc_disable: bool = True
     capture_universe_refresh_enable: bool = True
     capture_universe_refresh_interval_seconds: float = 60.0
@@ -121,6 +124,7 @@ class Config:
     data_dir: str = "./data"
     min_free_disk_gb: int | None = 5
     offline: bool = False
+    runtime_windows_high_res_timer_enable: bool = True
 
     def apply_overrides(self, overrides: dict[str, Any]) -> "Config":
         for field in fields(self):

@@ -87,6 +87,73 @@ def audit_heartbeat_gaps(
     }
 
 
+def audit_capture_quality(run_dir: Path) -> dict[str, Any]:
+    run_dir = run_dir.resolve()
+    capture_stop: dict[str, Any] | None = None
+    runlog_path = run_dir / "runlog.ndjson"
+    if runlog_path.exists():
+        with runlog_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record.get("record_type") == "capture_stop":
+                    capture_stop = record
+
+    reasons: list[str] = []
+    status = "unknown"
+    parse_worker_dropped = None
+    parse_results_dropped = None
+    loss_parse_queue_drops = None
+    loss_parse_results_drops = None
+    loss_metrics_drops = None
+
+    if capture_stop is not None and "quality_ok" in capture_stop:
+        status = "ok" if capture_stop.get("quality_ok") else "degraded"
+        reasons = list(capture_stop.get("quality_reasons") or [])
+        parse_worker_dropped = capture_stop.get("parse_worker_dropped")
+        parse_results_dropped = capture_stop.get("parse_results_dropped")
+        loss_parse_queue_drops = capture_stop.get("loss_parse_queue_drops")
+        loss_parse_results_drops = capture_stop.get("loss_parse_results_drops")
+        loss_metrics_drops = capture_stop.get("loss_metrics_drops")
+    else:
+        metrics_path = run_dir / "metrics" / "global.ndjson"
+        last_metrics: dict[str, Any] | None = None
+        if metrics_path.exists():
+            with metrics_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line:
+                        last_metrics = json.loads(line)
+        if last_metrics is not None:
+            parse_worker_dropped = last_metrics.get("parse_worker_dropped")
+            parse_results_dropped = last_metrics.get("parse_results_dropped")
+            loss_parse_queue_drops = last_metrics.get("loss_parse_queue_drops")
+            loss_parse_results_drops = last_metrics.get("loss_parse_results_drops")
+            loss_metrics_drops = last_metrics.get("loss_metrics_drops")
+            if int(loss_parse_queue_drops or 0) > 0 or int(parse_worker_dropped or 0) > 0:
+                reasons.append("parse_queue_drops")
+            if int(loss_parse_results_drops or 0) > 0 or int(parse_results_dropped or 0) > 0:
+                reasons.append("parse_results_drops")
+            if int(loss_metrics_drops or 0) > 0:
+                reasons.append("metrics_drops")
+            status = "degraded" if reasons else "ok"
+
+    quality_ok = status == "ok"
+    return {
+        "run_dir": str(run_dir),
+        "quality_status": status,
+        "quality_ok": quality_ok,
+        "quality_reasons": reasons,
+        "parse_worker_dropped": parse_worker_dropped,
+        "parse_results_dropped": parse_results_dropped,
+        "loss_parse_queue_drops": loss_parse_queue_drops,
+        "loss_parse_results_drops": loss_parse_results_drops,
+        "loss_metrics_drops": loss_metrics_drops,
+    }
+
+
 def inspect_run(run_dir: Path) -> InspectSummary:
     run_dir = run_dir.resolve()
     manifest_path = run_dir / "manifest.json"
@@ -223,6 +290,188 @@ def _latency_series_summary(records: list[dict[str, Any]], prefix: str) -> dict[
     }
 
 
+def _ns_series_as_ms(records: list[dict[str, Any]], key: str) -> list[float]:
+    values: list[float] = []
+    for record in records:
+        value = record.get(key)
+        if isinstance(value, int) and value >= 0:
+            values.append(value / 1_000_000.0)
+    return values
+
+
+def _ns_series_as_ms_when_true(
+    records: list[dict[str, Any]], key: str, flag_key: str
+) -> list[float]:
+    values: list[float] = []
+    for record in records:
+        if record.get(flag_key) is not True:
+            continue
+        value = record.get(key)
+        if isinstance(value, int) and value >= 0:
+            values.append(value / 1_000_000.0)
+    return values
+
+
+def _loop_lag_attribution(metrics_records: list[dict[str, Any]], *, top_n: int = 10) -> dict[str, Any]:
+    candidates: list[tuple[float, int]] = []
+    for idx, record in enumerate(metrics_records):
+        value = record.get("loop_lag_ms_max_last_interval")
+        if isinstance(value, (int, float)):
+            candidates.append((float(value), idx))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    top = candidates[: max(0, int(top_n))]
+
+    fields = (
+        "hb_mono_ns",
+        "loop_lag_ms_max_last_interval",
+        "hb_tick_work_ns",
+        "disk_check_ns",
+        "disk_free_bytes",
+        "universe_refresh_duration_ms",
+        "universe_refresh_worker_duration_ms",
+        "ws_in_q_depth_max",
+        "parse_q_depth_max",
+        "write_q_depth_max",
+        "dropped_messages_count",
+        "dropped_messages_total",
+        "ws_rx_to_enqueue_ms_p99",
+        "ws_rx_to_parsed_ms_p99",
+        "ws_rx_to_applied_ms_p99",
+        "write_end_to_apply_ms_p99",
+        "apply_update_ms_p99",
+    )
+
+    intervals: list[dict[str, Any]] = []
+    for rank, (lag_ms, idx) in enumerate(top, start=1):
+        record = metrics_records[idx]
+        payload: dict[str, Any] = {"rank": rank, "index": idx, "lag_ms": lag_ms}
+        for field in fields:
+            if field in record:
+                payload[field] = record.get(field)
+        intervals.append(payload)
+
+    return {"top_n": int(top_n), "top_intervals": intervals}
+
+
+def _histogram(values: list[float], *, bucket_edges: list[float]) -> dict[str, Any]:
+    if not bucket_edges:
+        raise ValueError("bucket_edges must be non-empty")
+    edges = sorted(float(edge) for edge in bucket_edges)
+    counts = [0 for _ in range(len(edges) + 1)]
+    for value in values:
+        placed = False
+        for idx, edge in enumerate(edges):
+            if value <= edge:
+                counts[idx] += 1
+                placed = True
+                break
+        if not placed:
+            counts[-1] += 1
+    total = sum(counts)
+    buckets: list[dict[str, Any]] = []
+    for idx, count in enumerate(counts):
+        upper = edges[idx] if idx < len(edges) else None
+        buckets.append(
+            {
+                "le": upper,
+                "count": count,
+                "pct": (100.0 * count / total) if total else 0.0,
+            }
+        )
+    return {"total": total, "bucket_edges": edges, "buckets": buckets}
+
+
+def _max_consecutive_true(flags: list[bool]) -> int:
+    max_streak = 0
+    current = 0
+    for flag in flags:
+        if flag:
+            current += 1
+            if current > max_streak:
+                max_streak = current
+            continue
+        current = 0
+    return max_streak
+
+
+def _pressure_streaks(
+    metrics_records: list[dict[str, Any]],
+    *,
+    streak_intervals: int = 5,
+    q_depth_max_threshold: int = 200,
+    ws_rx_to_parsed_ms_p99_threshold: float = 50.0,
+    ws_rx_to_applied_ms_p99_threshold: float = 100.0,
+    backpressure_ms_p99_threshold: float = 25.0,
+) -> dict[str, Any]:
+    streak_intervals = max(1, int(streak_intervals))
+    q_depth_max_threshold = max(0, int(q_depth_max_threshold))
+    ws_rx_to_parsed_ms_p99_threshold = float(ws_rx_to_parsed_ms_p99_threshold)
+    ws_rx_to_applied_ms_p99_threshold = float(ws_rx_to_applied_ms_p99_threshold)
+    backpressure_ms_p99_threshold = float(backpressure_ms_p99_threshold)
+
+    ws_in_flags: list[bool] = []
+    parse_flags: list[bool] = []
+    write_flags: list[bool] = []
+    parsed_flags: list[bool] = []
+    applied_flags: list[bool] = []
+    backpressure_flags: list[bool] = []
+
+    for record in metrics_records:
+        ws_in_q_max = record.get("ws_in_q_depth_max")
+        parse_q_max = record.get("parse_q_depth_max")
+        write_q_max = record.get("write_q_depth_max")
+        ws_rx_to_parsed_p99 = record.get("ws_rx_to_parsed_ms_p99")
+        ws_rx_to_applied_p99 = record.get("ws_rx_to_applied_ms_p99")
+        backpressure_ns_p99 = record.get("backpressure_ns_p99")
+
+        ws_in_flags.append(
+            isinstance(ws_in_q_max, int) and ws_in_q_max >= q_depth_max_threshold
+        )
+        parse_flags.append(
+            isinstance(parse_q_max, int) and parse_q_max >= q_depth_max_threshold
+        )
+        write_flags.append(
+            isinstance(write_q_max, int) and write_q_max >= q_depth_max_threshold
+        )
+        parsed_flags.append(
+            isinstance(ws_rx_to_parsed_p99, (int, float))
+            and float(ws_rx_to_parsed_p99) >= ws_rx_to_parsed_ms_p99_threshold
+        )
+        applied_flags.append(
+            isinstance(ws_rx_to_applied_p99, (int, float))
+            and float(ws_rx_to_applied_p99) >= ws_rx_to_applied_ms_p99_threshold
+        )
+        backpressure_flags.append(
+            isinstance(backpressure_ns_p99, int)
+            and (backpressure_ns_p99 / 1_000_000.0) >= backpressure_ms_p99_threshold
+        )
+
+    max_streaks = {
+        "ws_in_q_depth_max": _max_consecutive_true(ws_in_flags),
+        "parse_q_depth_max": _max_consecutive_true(parse_flags),
+        "write_q_depth_max": _max_consecutive_true(write_flags),
+        "ws_rx_to_parsed_ms_p99": _max_consecutive_true(parsed_flags),
+        "ws_rx_to_applied_ms_p99": _max_consecutive_true(applied_flags),
+        "backpressure_ms_p99": _max_consecutive_true(backpressure_flags),
+    }
+    worst_metric = max(max_streaks, key=lambda key: max_streaks[key], default=None)
+    worst_streak = max_streaks[worst_metric] if worst_metric else 0
+    failed = worst_streak >= streak_intervals and worst_streak > 0
+    return {
+        "streak_intervals": streak_intervals,
+        "thresholds": {
+            "q_depth_max": q_depth_max_threshold,
+            "ws_rx_to_parsed_ms_p99": ws_rx_to_parsed_ms_p99_threshold,
+            "ws_rx_to_applied_ms_p99": ws_rx_to_applied_ms_p99_threshold,
+            "backpressure_ms_p99": backpressure_ms_p99_threshold,
+        },
+        "max_streaks": max_streaks,
+        "worst_metric": worst_metric,
+        "worst_streak": worst_streak,
+        "failed": failed,
+    }
+
+
 def build_latency_report(run_dir: Path) -> dict[str, Any]:
     run_dir = run_dir.resolve()
     manifest_path = run_dir / "manifest.json"
@@ -330,6 +579,11 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
     loop_lag_stats = _series_stats(
         _numeric_series(metrics_records, "loop_lag_ms_max_last_interval")
     )
+    heartbeat_work_ms = _series_stats(_ns_series_as_ms(metrics_records, "hb_tick_work_ns"))
+    disk_check_performed_values = _ns_series_as_ms_when_true(
+        metrics_records, "disk_check_ns", "disk_check_performed"
+    )
+    disk_check_ms = _series_stats(disk_check_performed_values)
     dropped_count_stats = _series_stats(
         _numeric_series(metrics_records, "dropped_messages_count")
     )
@@ -368,6 +622,45 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
         for record in refresh_records
         if record.get("record_type") == "universe_refresh_error"
     )
+
+    hist_edges_ms = [0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0]
+    loop_lag_series = _numeric_series(metrics_records, "loop_lag_ms_max_last_interval")
+    stage_histograms = {
+        "ws_rx_to_enqueue_ms_p99": _histogram(
+            _numeric_series(metrics_records, "ws_rx_to_enqueue_ms_p99"),
+            bucket_edges=hist_edges_ms,
+        ),
+        "ws_rx_to_parsed_ms_p99": _histogram(
+            _numeric_series(metrics_records, "ws_rx_to_parsed_ms_p99"),
+            bucket_edges=hist_edges_ms,
+        ),
+        "ws_rx_to_applied_ms_p99": _histogram(
+            _numeric_series(metrics_records, "ws_rx_to_applied_ms_p99"),
+            bucket_edges=hist_edges_ms,
+        ),
+        "write_end_to_apply_ms_p99": _histogram(
+            _numeric_series(metrics_records, "write_end_to_apply_ms_p99"),
+            bucket_edges=hist_edges_ms,
+        ),
+        "apply_update_ms_p99": _histogram(
+            _numeric_series(metrics_records, "apply_update_ms_p99"),
+            bucket_edges=hist_edges_ms,
+        ),
+        "loop_lag_ms_max_last_interval": _histogram(
+            [float(value) for value in loop_lag_series],
+            bucket_edges=hist_edges_ms,
+        ),
+        "heartbeat_work_ms": _histogram(
+            _ns_series_as_ms(metrics_records, "hb_tick_work_ns"),
+            bucket_edges=hist_edges_ms,
+        ),
+        "disk_check_ms": _histogram(
+            disk_check_performed_values,
+            bucket_edges=hist_edges_ms,
+        ),
+    }
+
+    pressure = _pressure_streaks(metrics_records)
 
     report = {
         "run_dir": str(run_dir),
@@ -442,6 +735,12 @@ def build_latency_report(run_dir: Path) -> dict[str, Any]:
             "dropped_messages_per_interval": dropped_count_stats,
         },
         "loop_lag_ms": loop_lag_stats,
+        "heartbeat_work_ms": heartbeat_work_ms,
+        "disk_check_ms": disk_check_ms,
+        "disk_check_performed_count": len(disk_check_performed_values),
+        "loop_lag_attribution": _loop_lag_attribution(metrics_records),
+        "histograms_ms": stage_histograms,
+        "pressure_streaks": pressure,
         "refresh": {
             "duration_ms": refresh_duration_stats,
             "count": len(refresh_records),
@@ -517,9 +816,28 @@ def _latency_report_text(report: dict[str, Any]) -> str:
     )
     loop_lag = report.get("loop_lag_ms") or {}
     lines.append(
-        "loop_lag_ms: p95={:.3f} max={:.3f}".format(
+        "loop_lag_ms: p95={:.3f} p99={:.3f} max={:.3f}".format(
             float(loop_lag.get("p95", 0.0)),
+            float(loop_lag.get("p99", 0.0)),
             float(loop_lag.get("max", 0.0)),
+        )
+    )
+    hb_work = report.get("heartbeat_work_ms") or {}
+    lines.append(
+        "heartbeat_work_ms: p95={:.3f} p99={:.3f} max={:.3f}".format(
+            float(hb_work.get("p95", 0.0)),
+            float(hb_work.get("p99", 0.0)),
+            float(hb_work.get("max", 0.0)),
+        )
+    )
+    disk_check = report.get("disk_check_ms") or {}
+    disk_check_count = int(report.get("disk_check_performed_count", 0) or 0)
+    lines.append(
+        "disk_check_ms(performed): p95={:.3f} p99={:.3f} max={:.3f} count={}".format(
+            float(disk_check.get("p95", 0.0)),
+            float(disk_check.get("p99", 0.0)),
+            float(disk_check.get("max", 0.0)),
+            disk_check_count,
         )
     )
     refresh = report.get("refresh") or {}

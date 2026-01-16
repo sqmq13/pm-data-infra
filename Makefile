@@ -3,9 +3,7 @@ UV ?= uv
 .PHONY: setup test discover capture-bench-offline capture-verify
 
 setup:
-	$(UV) venv .venv
-	$(UV) pip install -r requirements.lock
-	$(UV) pip install -e .
+	$(UV) sync --frozen --dev
 
 test:
 	$(UV) run python -m pytest

@@ -13,6 +13,14 @@ from .strategy import PortfolioView, Strategy, StrategyContext
 
 
 @dataclass(slots=True)
+class EventLatencyTrace:
+    state_end_ns: int = 0
+    strategy_end_ns: int = 0
+    allocator_end_ns: int = 0
+    execution_end_ns: int = 0
+
+
+@dataclass(slots=True)
 class CallbackStats:
     count: int = 0
     total_ns: int = 0
@@ -93,12 +101,17 @@ class Orchestrator:
         )
 
     def process_event(
-        self, event: TopOfBookUpdate
+        self,
+        event: TopOfBookUpdate,
+        *,
+        trace: EventLatencyTrace | None = None,
     ) -> tuple[list[Intent], list[ExecutionEvent]]:
         self._seq += 1
         event.seq = self._seq
         market_state = self._state.get_market(event.market_id)
         market_state.apply_top_of_book(event)
+        if trace is not None:
+            trace.state_end_ns = int(self._clock_ns())
         intents_by_strategy: dict[str, list[Intent]] = {}
         for strategy_id in self._strategy_order:
             strategy = self._strategies[strategy_id]
@@ -121,10 +134,16 @@ class Orchestrator:
                 for intent in intents:
                     intent.strategy_id = strategy_id
                 intents_by_strategy[strategy_id] = intents
+        if trace is not None:
+            trace.strategy_end_ns = int(self._clock_ns())
         merged = self._allocator.merge_intents(intents_by_strategy, self._state)
+        if trace is not None:
+            trace.allocator_end_ns = int(self._clock_ns())
         execution_events: list[ExecutionEvent] = []
         if merged:
             execution_events = self._execution.submit(merged, self._now_ns())
+        if trace is not None:
+            trace.execution_end_ns = int(self._clock_ns())
         return merged, execution_events
 
     def run_events(self, events: Iterable[TopOfBookUpdate]) -> OrchestratorResult:

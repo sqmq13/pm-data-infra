@@ -44,8 +44,8 @@ All price/size values are fixed-point e6 integers; no floats on the hot path.
 `to_e6` uses round-half-up quantization in the normalizer.
 
 ToB extraction rule (hybrid):
-- For bids: if `len(bids) >= 2` and `bids[0].price < bids[1].price`, scan once for max; otherwise take `bids[0]`.
-- For asks: if `len(asks) >= 2` and `asks[0].price > asks[1].price`, scan once for min; otherwise take `asks[0]`.
+- For bids: if the list appears non-decreasing by price (sampled checks), take the last level as best bid; otherwise scan for the max-price valid level.
+- For asks: if the list appears non-increasing by price (sampled checks), take the last level as best ask; otherwise scan for the min-price valid level.
 
 ## 4. Determinism rules
 - Replay merge ordering across shards is `(rx_mono_ns, shard_id, idx_i)`.
@@ -56,7 +56,7 @@ ToB extraction rule (hybrid):
 
 Stable output:
 - Use `--stable-json` for replay output to make the JSON line byte-identical across runs.
-- Stable output keeps the same keys but forces `elapsed_ms` to a constant integer.
+- Stable output keeps the same keys but forces `elapsed_ms` to a constant value and canonicalizes nested dict key ordering.
 
 ## 5. CLI inventory
 Capture:
@@ -82,6 +82,11 @@ uv run pm_data run --mode replay --execution sim --run-dir data/runs/<RUN_ID> --
 Live sim dry run (prints summary JSON):
 ```bash
 uv run pm_data run --mode live --execution sim --duration-seconds 300 --print-summary-json
+```
+
+Live sim latency report (prints summary JSON + aggregated stage histograms):
+```bash
+uv run pm_data run --mode live --execution sim --duration-seconds 600 --print-summary-json --print-latency-report-json --strategy toy_spread
 ```
 
 Notes:
@@ -125,6 +130,11 @@ Key settings and defaults:
 | Universe refresh enable | `PM_DATA_CAPTURE_UNIVERSE_REFRESH_ENABLE` | `--capture-universe-refresh-enable` | `true` | Enabled by default. |
 | Universe refresh interval | `PM_DATA_CAPTURE_UNIVERSE_REFRESH_INTERVAL_SECONDS` | `--capture-universe-refresh-interval-seconds` | `60.0` | Base refresh cadence. |
 | Max markets safety cap | `PM_DATA_CAPTURE_MAX_MARKETS` | `--capture-max-markets` | `2000` | Upper bound on active-binary universe. |
+| Metrics sample cap | `PM_DATA_CAPTURE_METRICS_MAX_SAMPLES` | `--capture-metrics-max-samples` | `1024` | Caps per-metric sample deques (affects heartbeat quantiles cost). |
+| Disk usage check interval | `PM_DATA_CAPTURE_DISK_USAGE_INTERVAL_SECONDS` | `--capture-disk-usage-interval-seconds` | `10.0` | Heartbeat disk free check cadence (performed off-thread). |
+| Coverage metrics interval | `PM_DATA_CAPTURE_COVERAGE_METRICS_INTERVAL_SECONDS` | `--capture-coverage-metrics-interval-seconds` | `5.0` | Throttles expensive coverage_pct calculations. |
+| Windows high-res timer | `PM_DATA_CAPTURE_WINDOWS_HIGH_RES_TIMER_ENABLE` | `--capture-windows-high-res-timer-enable` | `true` | On Windows only: calls `timeBeginPeriod(1)` to reduce loop lag jitter. |
+| Runtime Windows high-res timer | `PM_DATA_RUNTIME_WINDOWS_HIGH_RES_TIMER_ENABLE` | `--runtime-windows-high-res-timer-enable` | `true` | On Windows only: wraps the live runtime event loop with `timeBeginPeriod(1)`. |
 | Data directory | `PM_DATA_DATA_DIR` | `--data-dir` | `./data` | Run bundle root. |
 
 ## 10. Capture operations playbook (Phase 1)
@@ -146,6 +156,8 @@ FAIL gates (any one is a failure):
 - Heartbeat gaps over 2s (`capture-audit` with default threshold reports `gaps_over_threshold > 0`).
 - Reconnects midrun (`capture-latency-report` shows `reconnects.total > 0` or `disconnected.midrun.incidents > 0`).
 - Drops (`capture-latency-report` shows `drops.dropped_messages_total > 0`).
+- Loop lag (`capture-latency-report` shows `loop_lag_ms.p99 > 10` or `loop_lag_ms.max > 100`).
+- Sustained pressure streaks (`capture-latency-report` shows `pressure_streaks.failed == true`).
 - CRC mismatch (`capture-verify` shows `totals.crc_mismatch > 0`).
 - `fatal.json` exists in the run directory.
 

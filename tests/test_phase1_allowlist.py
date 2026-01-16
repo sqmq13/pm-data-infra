@@ -30,6 +30,7 @@ def test_phase1_allowlist() -> None:
         "ws_runner",
         "writers_frames",
         "writers_ndjson",
+        "windows_timer",
     }
     banned = {
         "book",

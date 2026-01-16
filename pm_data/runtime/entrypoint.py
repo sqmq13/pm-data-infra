@@ -18,9 +18,11 @@ from .live import LiveDataSource, load_live_tokens
 from .intents import CancelIntent, Intent, PlaceOrderIntent
 from .normalize import Normalizer
 from .orchestrator import Orchestrator
+from .orchestrator import EventLatencyTrace
 from .state import GlobalState
 from .replay import ReplayDataSource
 from .strategy import Strategy
+from .latency import LiveLatencyCollector
 
 
 @dataclass(slots=True)
@@ -39,6 +41,18 @@ class RunSummary:
     callback_stats: Mapping[str, dict[str, float | int]] | None = None
     submitted_intents: int | None = None
     pnl_summary: Mapping[str, object] | None = None
+
+
+def _canonicalize_stable_json(value: object) -> object:
+    if isinstance(value, dict):
+        items: list[tuple[str, object]] = []
+        for key, item in value.items():
+            items.append((str(key), _canonicalize_stable_json(item)))
+        items.sort(key=lambda pair: pair[0])
+        return OrderedDict(items)
+    if isinstance(value, list):
+        return [_canonicalize_stable_json(item) for item in value]
+    return value
 
 
 def format_run_summary(summary: RunSummary, *, stable: bool) -> str:
@@ -64,6 +78,17 @@ def format_run_summary(summary: RunSummary, *, stable: bool) -> str:
         payload["pnl"] = summary.pnl_summary
     if summary.error:
         payload["error"] = summary.error
+    if stable:
+        payload = OrderedDict(
+            (key, _canonicalize_stable_json(value)) for key, value in payload.items()
+        )
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def format_latency_report(report: Mapping[str, object], *, stable: bool) -> str:
+    payload: object = report
+    if stable:
+        payload = _canonicalize_stable_json(dict(report))
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
@@ -248,7 +273,8 @@ async def _run_live_sim_async(
     strategy_names: Sequence[str] | None,
     strategy_params: Mapping[str, Mapping[str, object]] | None,
     token_ids: Sequence[str],
-) -> RunSummary:
+    latency_report: bool,
+) -> tuple[RunSummary, dict[str, object] | None]:
     start = time.perf_counter()
     strategies = _build_strategies(strategy_names, strategy_params)
     state = GlobalState()
@@ -271,25 +297,57 @@ async def _run_live_sim_async(
     intents = 0
     submitted_intents = 0
     stop = False
+    collector: LiveLatencyCollector | None = LiveLatencyCollector() if latency_report else None
+    if collector is not None:
+        collector.start(time.perf_counter_ns())
 
     async for frame in data_source.stream():
-        for event in normalizer.normalize(frame):
-            canonical_events += 1
-            merged, _exec_events = orchestrator.process_event(event)
-            if merged:
-                for intent in merged:
-                    hasher.update(_hash_intent_line(event.seq, intent))
-                intents += len(merged)
-                submitted_intents += len(merged)
-            if max_events is not None and canonical_events >= max_events:
-                stop = True
-                break
+        if collector is not None:
+            collector.frames += 1
+            recv_ns = frame.rx_mono_ns
+            for event, decode_end_ns, normalize_end_ns in normalizer.iter_normalize_timed(
+                frame
+            ):
+                trace = EventLatencyTrace()
+                canonical_events += 1
+                merged, _exec_events = orchestrator.process_event(event, trace=trace)
+                collector.observe_event(
+                    recv_ns=recv_ns,
+                    decode_end_ns=decode_end_ns,
+                    normalize_end_ns=normalize_end_ns,
+                    state_end_ns=trace.state_end_ns,
+                    strategy_end_ns=trace.strategy_end_ns,
+                    allocator_end_ns=trace.allocator_end_ns,
+                    execution_end_ns=trace.execution_end_ns,
+                    emit_end_ns=trace.execution_end_ns,
+                )
+                if merged:
+                    for intent in merged:
+                        hasher.update(_hash_intent_line(event.seq, intent))
+                    intents += len(merged)
+                    submitted_intents += len(merged)
+                    collector.intents += len(merged)
+                if max_events is not None and canonical_events >= max_events:
+                    stop = True
+                    break
+        else:
+            for event in normalizer.iter_normalize(frame):
+                canonical_events += 1
+                merged, _exec_events = orchestrator.process_event(event)
+                if merged:
+                    for intent in merged:
+                        hasher.update(_hash_intent_line(event.seq, intent))
+                    intents += len(merged)
+                    submitted_intents += len(merged)
+                if max_events is not None and canonical_events >= max_events:
+                    stop = True
+                    break
         if stop:
             break
 
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     final_hash = hasher.hexdigest()
-    return RunSummary(
+    summary = RunSummary(
         ok=True,
         mode="live",
         execution="sim",
@@ -304,6 +362,22 @@ async def _run_live_sim_async(
         callback_stats=_callback_stats_payload(orchestrator.callback_stats()),
         submitted_intents=submitted_intents,
     )
+    report: dict[str, object] | None = None
+    if collector is not None:
+        collector.finish(time.perf_counter_ns())
+        report = collector.report(
+            reconnects=data_source.stats.reconnects,
+            dropped=data_source.stats.dropped.total,
+            decode_errors=normalizer.decode_errors,
+            schema_errors=normalizer.schema_errors,
+            bid_scan_count=normalizer.bid_scan_count,
+            bid_scan_levels_total=normalizer.bid_scan_levels_total,
+            bid_scan_levels_max=normalizer.bid_scan_levels_max,
+            ask_scan_count=normalizer.ask_scan_count,
+            ask_scan_levels_total=normalizer.ask_scan_levels_total,
+            ask_scan_levels_max=normalizer.ask_scan_levels_max,
+        )
+    return summary, report
 
 
 def run_live_sim(
@@ -313,15 +387,20 @@ def run_live_sim(
     max_events: int | None = None,
     strategy_names: Sequence[str] | None = None,
     strategy_params: Mapping[str, Mapping[str, object]] | None = None,
-) -> RunSummary:
+    latency_report: bool = False,
+) -> tuple[RunSummary, dict[str, object] | None]:
     token_ids = load_live_tokens(config)
-    return asyncio.run(
-        _run_live_sim_async(
-            config=config,
-            duration_seconds=duration_seconds,
-            max_events=max_events,
-            strategy_names=strategy_names,
-            strategy_params=strategy_params,
-            token_ids=token_ids,
+    from pm_data.windows_timer import windows_high_res_timer
+
+    with windows_high_res_timer(enable=config.runtime_windows_high_res_timer_enable):
+        return asyncio.run(
+            _run_live_sim_async(
+                config=config,
+                duration_seconds=duration_seconds,
+                max_events=max_events,
+                strategy_names=strategy_names,
+                strategy_params=strategy_params,
+                token_ids=token_ids,
+                latency_report=latency_report,
+            )
         )
-    )

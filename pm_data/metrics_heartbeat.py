@@ -52,6 +52,10 @@ async def _heartbeat_loop(state: CaptureState) -> None:
     interval_ns = int(state.config.capture_heartbeat_interval_seconds * 1_000_000_000)
     run_dir = state.run.run_dir
     grace_ns = int(state.config.capture_universe_refresh_grace_seconds * 1_000_000_000)
+    disk_interval_ns = int(state.config.capture_disk_usage_interval_seconds * 1_000_000_000)
+    coverage_interval_ns = int(
+        state.config.capture_coverage_metrics_interval_seconds * 1_000_000_000
+    )
     metrics_global = run_dir / "metrics" / "global.ndjson"
     metrics_shard_paths = {
         shard.shard_id: run_dir / "metrics" / f"shard_{shard.shard_id:02d}.ndjson"
@@ -65,6 +69,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             await asyncio.sleep((next_tick - now_ns) / 1_000_000_000)
             continue
         now_ns = monotonic_ns()
+        hb_tick_start_ns = now_ns
         hb_wall_ns_utc = time.time_ns()
         elapsed_ns = now_ns - state.run.t0_mono_ns
         _write_runlog(
@@ -133,7 +138,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
         global_reconnects = 0
         global_confirm_failures = 0
         global_unconfirmed_count = 0
-        global_tokens_seen: set[str] = set()
+        global_tokens_seen_count = 0
         global_coverage_pct = 0.0
 
         for shard in state.shards:
@@ -145,7 +150,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             global_confirm_failures += shard.confirm_failures
             if shard.confirm_deadline_mono_ns is not None and not shard.confirmed:
                 global_unconfirmed_count += 1
-            global_tokens_seen.update(shard_stats.token_ids)
+            global_tokens_seen_count += len(shard_stats.token_ids)
             global_write_samples.extend(shard_stats.write_durations_ns)
             global_ingest_samples.extend(shard_stats.ingest_latencies_ns)
             global_backpressure_samples.extend(shard_stats.backpressure_ns)
@@ -170,14 +175,21 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 ) / 1_000_000_000.0
                 shard_midrun_incidents += 1
 
-            shard_coverage_pct = _coverage_pct(
-                shard.token_ids,
-                shard.last_seen,
-                now_ns,
-                None,
-                token_added_mono_ns=state.universe.token_added_mono_ns,
-                grace_ns=grace_ns,
-            )
+            if (
+                coverage_interval_ns <= 0
+                or shard.coverage_mono_ns_last == 0
+                or now_ns - shard.coverage_mono_ns_last >= coverage_interval_ns
+            ):
+                shard.coverage_pct_last = _coverage_pct(
+                    shard.token_ids,
+                    shard.last_seen,
+                    now_ns,
+                    None,
+                    token_added_mono_ns=state.universe.token_added_mono_ns,
+                    grace_ns=grace_ns,
+                )
+                shard.coverage_mono_ns_last = now_ns
+            shard_coverage_pct = shard.coverage_pct_last
             write_quantiles = _quantiles_from_samples(
                 shard_stats.write_durations_ns, (50, 95, 99)
             )
@@ -237,17 +249,52 @@ async def _heartbeat_loop(state: CaptureState) -> None:
                 await asyncio.sleep(0)
 
         if state.pinned_tokens:
-            last_seen_global: dict[str, int] = {}
-            for shard in state.shards:
-                last_seen_global.update(shard.last_seen)
-            global_coverage_pct = _coverage_pct(
-                state.pinned_tokens,
-                last_seen_global,
-                now_ns,
-                None,
-                token_added_mono_ns=state.universe.token_added_mono_ns,
-                grace_ns=grace_ns,
-            )
+            if (
+                coverage_interval_ns <= 0
+                or state.global_coverage_mono_ns_last == 0
+                or now_ns - state.global_coverage_mono_ns_last >= coverage_interval_ns
+            ):
+                last_seen_global: dict[str, int] = {}
+                for shard in state.shards:
+                    last_seen_global.update(shard.last_seen)
+                state.global_coverage_pct_last = _coverage_pct(
+                    state.pinned_tokens,
+                    last_seen_global,
+                    now_ns,
+                    None,
+                    token_added_mono_ns=state.universe.token_added_mono_ns,
+                    grace_ns=grace_ns,
+                )
+                state.global_coverage_mono_ns_last = now_ns
+            global_coverage_pct = state.global_coverage_pct_last
+
+        disk_total_bytes = state.disk_total_bytes_last
+        disk_used_bytes = state.disk_used_bytes_last
+        disk_free_bytes = state.disk_free_bytes_last
+        disk_check_ns = 0
+        disk_check_performed = False
+        if state.config.min_free_disk_gb is not None:
+            if (
+                disk_interval_ns <= 0
+                or state.disk_check_mono_ns_last == 0
+                or now_ns - state.disk_check_mono_ns_last >= disk_interval_ns
+            ):
+                disk_check_start_ns = monotonic_ns()
+                usage = await asyncio.get_running_loop().run_in_executor(
+                    None, shutil.disk_usage, run_dir
+                )
+                disk_check_ns = max(0, monotonic_ns() - disk_check_start_ns)
+                disk_total_bytes = int(usage.total)
+                disk_used_bytes = int(usage.used)
+                disk_free_bytes = int(usage.free)
+                state.disk_total_bytes_last = disk_total_bytes
+                state.disk_used_bytes_last = disk_used_bytes
+                state.disk_free_bytes_last = disk_free_bytes
+                state.disk_check_ns_last = disk_check_ns
+                state.disk_check_mono_ns_last = now_ns
+                disk_check_performed = True
+            else:
+                disk_check_ns = 0
 
         fee_rate_stats = (
             state.fee_rate_client.stats_snapshot() if state.fee_rate_client else {}
@@ -351,7 +398,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "backpressure_ns_p95": global_backpressure_quantiles[95],
             "backpressure_ns_p99": global_backpressure_quantiles[99],
             "coverage_pct": global_coverage_pct,
-            "token_ids_seen": len(global_tokens_seen),
+            "token_ids_seen": global_tokens_seen_count,
             "token_ids_assigned": len(state.pinned_tokens),
             "reconnects": global_reconnects,
             "confirm_failures": global_confirm_failures,
@@ -443,6 +490,11 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "loss_frame_write_queue_pressure_events": (
                 loss_budget.frame_write_queue_pressure_events.total
             ),
+            "disk_total_bytes": disk_total_bytes,
+            "disk_used_bytes": disk_used_bytes,
+            "disk_free_bytes": disk_free_bytes,
+            "disk_check_ns": disk_check_ns,
+            "disk_check_performed": disk_check_performed,
             "metrics_writer_queue_size": metrics_writer_stats.get("queue_size", 0),
             "metrics_writer_errors": metrics_writer_stats.get("errors", 0),
             "parse_queue_size": parse_stats.get("queue_size", 0),
@@ -458,6 +510,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             "frame_write_results_dropped": frame_write_results_dropped,
             "frame_write_processed": frame_write_stats.get("processed", 0),
         }
+        global_record["hb_tick_work_ns"] = max(0, monotonic_ns() - hb_tick_start_ns)
         _write_metrics(state, metrics_global, global_record)
         state.heartbeat_samples.append(global_record)
 
@@ -470,8 +523,7 @@ async def _heartbeat_loop(state: CaptureState) -> None:
             break
 
         if state.config.min_free_disk_gb is not None:
-            usage = shutil.disk_usage(run_dir)
-            free_gb = usage.free / (1024**3)
+            free_gb = disk_free_bytes / (1024**3) if disk_free_bytes else 0.0
             if free_gb < state.config.min_free_disk_gb:
                 await _trigger_fatal(
                     state,

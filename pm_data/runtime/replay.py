@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Iterable
@@ -31,6 +32,10 @@ class _ShardStream:
     frames_fh: object
 
 
+def _crc32(payload: bytes) -> int:
+    return zlib.crc32(payload) & 0xFFFFFFFF
+
+
 def _parse_shard_id(path: Path) -> int:
     stem = path.stem
     if "_" not in stem:
@@ -39,7 +44,13 @@ def _parse_shard_id(path: Path) -> int:
     return int(suffix)
 
 
-def _read_frame_from_entry(stream: _ShardStream, entry, idx_i: int) -> RawFrame:
+def _read_frame_from_entry(
+    stream: _ShardStream,
+    entry,
+    idx_i: int,
+    *,
+    verify_crc: bool,
+) -> RawFrame:
     frames_fh = stream.frames_fh
     frames_fh.seek(entry.offset_frames)
     magic = frames_fh.read(8)
@@ -78,6 +89,19 @@ def _read_frame_from_entry(stream: _ShardStream, entry, idx_i: int) -> RawFrame:
     payload = frames_fh.read(payload_len)
     if len(payload) != payload_len:
         raise ValueError("truncated frames payload")
+    if verify_crc:
+        actual_crc32 = _crc32(payload)
+        if actual_crc32 != payload_crc32:
+            raise ValueError(
+                "payload_crc32 mismatch "
+                f"shard_id={stream.shard_id} "
+                f"idx_i={idx_i} "
+                f"offset_frames={entry.offset_frames} "
+                f"rx_mono_ns={rx_mono_ns} "
+                f"payload_len={payload_len} "
+                f"expected={payload_crc32} "
+                f"actual={actual_crc32}"
+            )
     return RawFrame(
         payload=payload,
         rx_mono_ns=rx_mono_ns,
@@ -93,9 +117,11 @@ class ReplayDataSource:
         *,
         run_dir: Path,
         max_seconds: float | None = None,
+        verify_crc: bool = True,
     ) -> None:
         self._run_dir = Path(run_dir).resolve()
         self._max_seconds = max_seconds
+        self._verify_crc = verify_crc
 
     def iter_frames(self) -> Iterable[RawFrame]:
         capture_dir = self._run_dir / "capture"
@@ -140,7 +166,12 @@ class ReplayDataSource:
                 if max_ns is not None and rx_mono_ns - start_mono_ns > max_ns:
                     break
                 entry = stream.idx_entries[idx_i]
-                yield _read_frame_from_entry(stream, entry, idx_i)
+                yield _read_frame_from_entry(
+                    stream,
+                    entry,
+                    idx_i,
+                    verify_crc=self._verify_crc,
+                )
                 next_i = idx_i + 1
                 if next_i < len(stream.idx_entries):
                     next_entry = stream.idx_entries[next_i]

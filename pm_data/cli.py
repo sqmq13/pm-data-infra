@@ -20,12 +20,24 @@ except ImportError:
 
 from .config import Config
 from .capture_offline import quantile, run_capture_offline
-from .capture_inspect import audit_heartbeat_gaps, inspect_run, write_latency_report
+from .capture_inspect import (
+    audit_capture_quality,
+    audit_heartbeat_gaps,
+    build_latency_report,
+    inspect_run,
+    write_latency_report,
+)
 from .capture_online import run_capture_online
 from .capture_format import verify_frames
 from .capture_slice import slice_run
 from .gamma import fetch_markets, select_active_binary_markets
-from .runtime.entrypoint import RunSummary, format_run_summary, run_live_sim, run_replay_sim
+from .runtime.entrypoint import (
+    RunSummary,
+    format_latency_report,
+    format_run_summary,
+    run_live_sim,
+    run_replay_sim,
+)
 
 
 def _unwrap_optional(field_type: Any) -> tuple[Any, bool]:
@@ -174,6 +186,7 @@ def main(argv: list[str] | None = None) -> int:
     capture = subparsers.add_parser("capture", parents=[common])
     capture.add_argument("--run-id", default=None)
     capture.add_argument("--fixtures-dir", default="testdata/fixtures")
+    capture.add_argument("--duration-seconds", type=float, default=None)
 
     capture_verify = subparsers.add_parser("capture-verify", parents=[common])
     capture_verify.add_argument("--frames", default=None)
@@ -193,6 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     capture_audit = subparsers.add_parser("capture-audit", parents=[common])
     capture_audit.add_argument("--run-dir", required=True)
     capture_audit.add_argument("--threshold-seconds", type=float, default=2.0)
+    capture_audit.add_argument("--max-loop-lag-p99-ms", type=float, default=10.0)
+    capture_audit.add_argument("--max-loop-lag-max-ms", type=float, default=100.0)
+    capture_audit.add_argument("--no-latency-gates", action="store_true", default=False)
 
     capture_latency_report = subparsers.add_parser(
         "capture-latency-report", parents=[common]
@@ -220,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--print-hash", action="store_true", default=False)
     run.add_argument("--print-pnl", action="store_true", default=False)
     run.add_argument("--print-summary-json", action="store_true", default=False)
+    run.add_argument("--print-latency-report-json", action="store_true", default=False)
     run.add_argument("--stable-json", action="store_true", default=False)
 
     args = parser.parse_args(argv)
@@ -246,7 +263,11 @@ def main(argv: list[str] | None = None) -> int:
             result = run_capture_offline(config, Path(args.fixtures_dir), run_id=args.run_id)
             print(f"capture run dir: {result.run.run_dir}")
             return 0
-        return run_capture_online(config, run_id=args.run_id)
+        return run_capture_online(
+            config,
+            run_id=args.run_id,
+            duration_seconds=args.duration_seconds,
+        )
     if args.command == "capture-verify":
         try:
             targets = _resolve_verify_targets(args)
@@ -318,15 +339,82 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "capture-audit":
         try:
+            run_dir = Path(args.run_dir)
             summary = audit_heartbeat_gaps(
-                Path(args.run_dir),
+                run_dir,
                 threshold_seconds=args.threshold_seconds,
             )
+            quality = audit_capture_quality(run_dir)
+            summary.update(
+                {
+                    "quality_status": quality["quality_status"],
+                    "quality_ok": quality["quality_ok"],
+                    "quality_reasons": quality["quality_reasons"],
+                    "parse_worker_dropped": quality["parse_worker_dropped"],
+                    "parse_results_dropped": quality["parse_results_dropped"],
+                    "loss_parse_queue_drops": quality["loss_parse_queue_drops"],
+                    "loss_parse_results_drops": quality["loss_parse_results_drops"],
+                    "loss_metrics_drops": quality["loss_metrics_drops"],
+                }
+            )
+            latency_gates_ok = True
+            latency_gates: dict[str, Any] = {"enabled": not args.no_latency_gates}
+            if not args.no_latency_gates:
+                latency_report = build_latency_report(run_dir)
+                loop_lag = latency_report.get("loop_lag_ms") or {}
+                loop_lag_count = int(loop_lag.get("count", 0) or 0)
+                reconnects_total = int((latency_report.get("reconnects") or {}).get("total", 0))
+                dropped_total = int((latency_report.get("drops") or {}).get("dropped_messages_total", 0))
+                midrun_incidents = int(
+                    ((latency_report.get("disconnected") or {}).get("midrun") or {}).get(
+                        "incidents", 0
+                    )
+                )
+                loop_lag_p99 = float(loop_lag.get("p99", 0.0))
+                loop_lag_max = float(loop_lag.get("max", 0.0))
+                reasons: list[str] = []
+                if loop_lag_count <= 0:
+                    reasons.append("missing_loop_lag_metrics")
+                if reconnects_total > 0:
+                    reasons.append("reconnects_total")
+                if midrun_incidents > 0:
+                    reasons.append("midrun_disconnected_incidents")
+                if dropped_total > 0:
+                    reasons.append("dropped_messages_total")
+                if loop_lag_p99 > float(args.max_loop_lag_p99_ms):
+                    reasons.append("loop_lag_p99_ms")
+                if loop_lag_max > float(args.max_loop_lag_max_ms):
+                    reasons.append("loop_lag_max_ms")
+                pressure = latency_report.get("pressure_streaks") or {}
+                if pressure.get("failed") is True:
+                    reasons.append("pressure_streaks")
+                latency_gates_ok = not reasons
+                latency_gates.update(
+                    {
+                        "ok": latency_gates_ok,
+                        "reasons": reasons,
+                        "reconnects_total": reconnects_total,
+                        "midrun_disconnected_incidents": midrun_incidents,
+                        "dropped_messages_total": dropped_total,
+                        "loop_lag_count": loop_lag_count,
+                        "loop_lag_p99_ms": loop_lag_p99,
+                        "loop_lag_max_ms": loop_lag_max,
+                        "pressure_streaks": pressure,
+                    }
+                )
+            else:
+                latency_gates["ok"] = True
+            summary["latency_gates"] = latency_gates
         except Exception as exc:
             print(str(exc), file=sys.stderr)
             return 2
         print(json.dumps(summary, ensure_ascii=True, separators=(",", ":")))
-        return 0
+        ok = (
+            summary["gaps_over_threshold"] == 0
+            and summary.get("quality_ok") is True
+            and summary.get("latency_gates", {}).get("ok") is True
+        )
+        return 0 if ok else 1
     if args.command == "capture-latency-report":
         try:
             report = write_latency_report(Path(args.run_dir))
@@ -357,6 +445,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             _validate_run_mode_args(args)
             if args.mode == "replay":
+                if args.print_latency_report_json:
+                    raise ValueError(
+                        "--print-latency-report-json is only supported for live mode"
+                    )
                 if not args.print_hash:
                     raise ValueError("--print-hash is required for replay mode")
                 if not args.run_dir:
@@ -369,17 +461,19 @@ def main(argv: list[str] | None = None) -> int:
                     include_pnl=args.print_pnl,
                 )
             else:
-                if not args.print_summary_json:
-                    raise ValueError("--print-summary-json is required for live mode")
                 if args.duration_seconds is None:
                     raise ValueError("--duration-seconds is required for live mode")
-                summary = run_live_sim(
+                summary, latency_report = run_live_sim(
                     config=config,
                     duration_seconds=args.duration_seconds,
                     max_events=args.max_events,
                     strategy_names=args.strategy,
+                    latency_report=args.print_latency_report_json,
                 )
-            print(format_run_summary(summary, stable=stable_json))
+                if args.print_latency_report_json and latency_report is not None:
+                    print(format_latency_report(latency_report, stable=False))
+            if args.mode == "replay" or args.print_summary_json:
+                print(format_run_summary(summary, stable=stable_json))
             return 0 if summary.ok else 1
         except Exception as exc:
             summary = RunSummary(
@@ -392,7 +486,8 @@ def main(argv: list[str] | None = None) -> int:
                 elapsed_ms=0.0,
                 error=str(exc),
             )
-            print(format_run_summary(summary, stable=stable_json))
+            if args.mode == "replay" or args.print_summary_json:
+                print(format_run_summary(summary, stable=stable_json))
             return 2
     return 1
 

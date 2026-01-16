@@ -54,6 +54,8 @@ def test_latency_report_writes(tmp_path: Path) -> None:
     result = run_capture_offline(config, fixtures_dir, run_id="latency-report-run")
     report = write_latency_report(result.run.run_dir)
     assert report["run_id"] == result.run.run_id
+    assert "histograms_ms" in report
+    assert "loop_lag_attribution" in report
     json_path = result.run.run_dir / "latency_report.json"
     text_path = result.run.run_dir / "latency_report.txt"
     assert json_path.exists()

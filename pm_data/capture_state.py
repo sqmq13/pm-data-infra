@@ -191,6 +191,8 @@ class ShardState:
     startup_connect_time_s: float = 0.0
     midrun_disconnected_time_s_total: float = 0.0
     midrun_disconnected_incidents: int = 0
+    coverage_pct_last: float = 0.0
+    coverage_mono_ns_last: int = 0
 
 
 @dataclass
@@ -302,3 +304,10 @@ class CaptureState:
     fatal_event: asyncio.Event = field(default_factory=asyncio.Event)
     fatal_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     heartbeat_samples: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=10))
+    global_coverage_pct_last: float = 0.0
+    global_coverage_mono_ns_last: int = 0
+    disk_check_mono_ns_last: int = 0
+    disk_total_bytes_last: int = 0
+    disk_used_bytes_last: int = 0
+    disk_free_bytes_last: int = 0
+    disk_check_ns_last: int = 0

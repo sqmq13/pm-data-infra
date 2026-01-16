@@ -1263,7 +1263,12 @@ async def _refresh_loop(state: CaptureState) -> None:
             state.refresh_executor = None
 
 
-async def _capture_online_async(config: Config, run_id: str | None = None) -> int:
+async def _capture_online_async(
+    config: Config,
+    run_id: str | None = None,
+    *,
+    duration_seconds: float | None = None,
+) -> int:
     if config.ws_shards <= 0:
         raise ValueError("ws_shards must be >= 1")
     (
@@ -1477,10 +1482,37 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
         tasks.append(refresh_task)
     stop_task = asyncio.create_task(state.stop_event.wait())
     tasks.append(stop_task)
+    if duration_seconds is not None and duration_seconds > 0:
+        async def _stop_after_duration() -> None:
+            await asyncio.sleep(duration_seconds)
+            if state.fatal_event.is_set() or state.stop_event.is_set():
+                return
+            state.stop_reason = "duration"
+            state.stop_event.set()
+
+        tasks.append(asyncio.create_task(_stop_after_duration()))
 
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     if state.stop_event.is_set() and not state.fatal_event.is_set():
         loss_budget = state.loss_budget
+        parse_worker_stats: dict[str, int] = {}
+        if state.parse_worker is not None:
+            parse_worker_stats = state.parse_worker.stats()
+        parse_worker_dropped = int(parse_worker_stats.get("dropped", 0))
+        parse_results_dropped = int(parse_worker_stats.get("results_dropped", 0))
+        quality_reasons: list[str] = []
+        if loss_budget.parse_queue_drops.total > 0 or parse_worker_dropped > 0:
+            quality_reasons.append("parse_queue_drops")
+        if loss_budget.parse_results_drops.total > 0 or parse_results_dropped > 0:
+            quality_reasons.append("parse_results_drops")
+        if loss_budget.metrics_drops.total > 0:
+            quality_reasons.append("metrics_drops")
+        if loss_budget.runlog_enqueue_timeouts.total > 0:
+            quality_reasons.append("runlog_enqueue_timeouts")
+        if loss_budget.frame_write_queue_pressure_events.total > 0:
+            quality_reasons.append("frame_write_queue_pressure_events")
+        quality_ok = not quality_reasons
+        quality_status = "ok" if quality_ok else "degraded"
         loss_total = (
             loss_budget.parse_queue_drops.total
             + loss_budget.parse_results_drops.total
@@ -1502,6 +1534,11 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
                 "loss_frame_write_queue_pressure_events": (
                     loss_budget.frame_write_queue_pressure_events.total
                 ),
+                "parse_worker_dropped": parse_worker_dropped,
+                "parse_results_dropped": parse_results_dropped,
+                "quality_status": quality_status,
+                "quality_ok": quality_ok,
+                "quality_reasons": quality_reasons,
             },
         )
     if not state.fatal_event.is_set():
@@ -1549,8 +1586,22 @@ async def _capture_online_async(config: Config, run_id: str | None = None) -> in
     return 1 if state.fatal_event.is_set() else 0
 
 
-def run_capture_online(config: Config, run_id: str | None = None) -> int:
+def run_capture_online(
+    config: Config,
+    run_id: str | None = None,
+    *,
+    duration_seconds: float | None = None,
+) -> int:
     try:
-        return asyncio.run(_capture_online_async(config, run_id=run_id))
+        from .windows_timer import windows_high_res_timer
+
+        with windows_high_res_timer(enable=config.capture_windows_high_res_timer_enable):
+            return asyncio.run(
+                _capture_online_async(
+                    config,
+                    run_id=run_id,
+                    duration_seconds=duration_seconds,
+                )
+            )
     except KeyboardInterrupt:
         return 0

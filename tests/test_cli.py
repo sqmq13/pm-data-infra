@@ -14,9 +14,10 @@ def _run_capture(monkeypatch, args):
 
         return Dummy()
 
-    def _capture_online(config, run_id=None):
+    def _capture_online(config, run_id=None, *, duration_seconds=None):
         calls["offline"] = config.offline
         calls["capture_online"] += 1
+        assert duration_seconds is None or isinstance(duration_seconds, float)
         return 0
 
     monkeypatch.setattr(cli, "run_capture_offline", _capture_offline)
@@ -47,3 +48,10 @@ def test_offline_flag_false(monkeypatch):
     assert calls["offline"] is False
     assert calls["capture_online"] == 1
     assert calls["capture_offline"] == 0
+
+
+def test_capture_duration_seconds_passed(monkeypatch):
+    calls, exit_code = _run_capture(monkeypatch, ["--offline", "false", "--duration-seconds", "1.5"])
+    assert exit_code == 0
+    assert calls["offline"] is False
+    assert calls["capture_online"] == 1
